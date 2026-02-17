@@ -1,0 +1,48 @@
+{
+  "display_information": {
+    "name": "DecisionVault",
+    "description": "Capture decision-related Slack threads with high precision.",
+    "background_color": "#1C2B33"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "DecisionVault",
+      "always_online": false
+    },
+    "slash_commands": [
+      {
+        "command": "/decisionvault",
+        "url": "https://your-domain.com/api/slack/command",
+        "description": "Capture a decision from the current thread.",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://your-domain.com/api/slack/oauth/callback"
+    ],
+    "scopes": {
+      "bot": [
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "commands"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://your-domain.com/api/slack/events",
+      "bot_events": [
+        "message.channels",
+        "message.groups"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": false
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false
+  }
+}
