@@ -7,6 +7,7 @@ import asyncpg
 
 from app.core.config import settings
 from app.db.postgres import get_pg_pool
+from app.services.cache_service import build_cache_key, cache_get, cache_set
 
 
 @dataclass
@@ -37,6 +38,21 @@ def generate_embedding(text: str) -> list[float]:
     model = _load_model()
     vector = model.encode([text], normalize_embeddings=True)
     return vector[0].tolist()
+
+
+async def generate_embedding_cached(tenant_id: str, text: str) -> list[float]:
+    normalized = " ".join(text.split()).strip().lower()
+    key = build_cache_key(
+        feature="embedding",
+        tenant_id=tenant_id,
+        normalized_input=normalized,
+    )
+    cached = await cache_get(key)
+    if cached:
+        return [float(x) for x in cached]
+    vector = generate_embedding(text)
+    await cache_set(key, vector, 7 * 24 * 60 * 60)
+    return vector
 
 
 def _build_embedding_text(title: str | None, statement: str | None, context: str | None) -> str:
@@ -82,7 +98,7 @@ async def embed_and_store_decision(payload: dict) -> None:
     text = _build_embedding_text(payload.get("title"), payload.get("statement"), payload.get("context"))
     if not text:
         return
-    vector = generate_embedding(text)
+    vector = await generate_embedding_cached(str(payload.get("tenant_id")), text)
     record = DecisionEmbeddingRecord(
         decision_id=str(payload.get("_id") or payload.get("decision_id")),
         tenant_id=str(payload.get("tenant_id")),

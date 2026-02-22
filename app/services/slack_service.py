@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 import time
 
 from slack_sdk.http_retry import RetryHandler
@@ -19,6 +20,14 @@ from app.services.license_service import evaluate_license_status, get_current_li
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_aware_utc(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _verify_slack_signature(raw_body: bytes, timestamp: str, signature: str) -> bool:
@@ -54,6 +63,8 @@ async def store_installation(
                 "bot_token": encrypt_token(bot_token),
                 "installed_at": _utcnow(),
                 "channels": [],
+                "revoked_at": None,
+                "revoked_reason": None,
             }
         },
         upsert=True,
@@ -115,10 +126,10 @@ class SlackRetryHandler(RetryHandler):
         self.base_delay = base_delay
         self.max_delay = max_delay
 
-    def can_retry(self, *, state, request, response, error):
+    def can_retry(self, *, state, request, response, error=None, **kwargs):
         return response is not None and response.status_code >= 500
 
-    def prepare_for_next_attempt(self, *, state, request, response, error):
+    def prepare_for_next_attempt(self, *, state, request, response, error=None, **kwargs):
         attempt = state.current_attempt
         delay = min(self.base_delay * (2 ** attempt), self.max_delay)
         time.sleep(delay)
@@ -135,13 +146,29 @@ def slack_client(bot_token: str) -> WebClient:
 async def list_channels(installation: dict) -> list[dict]:
     cache_age = None
     if installation.get("channels_cache_at"):
-        cache_age = (_utcnow() - installation["channels_cache_at"]).total_seconds()
+        cache_at = _as_aware_utc(installation.get("channels_cache_at"))
+        if cache_at:
+            cache_age = (_utcnow() - cache_at).total_seconds()
     if installation.get("channels_cache") and cache_age is not None:
         if cache_age < settings.slack_channel_cache_seconds:
             return installation["channels_cache"]
 
     client = slack_client(installation_token(installation))
-    response = client.conversations_list(types="public_channel,private_channel")
+    try:
+        response = client.conversations_list(types="public_channel,private_channel")
+    except SlackApiError as exc:
+        # If app is installed without private-channel scope, fallback to public channels.
+        error_code = None
+        needed_scope = None
+        try:
+            error_code = exc.response.get("error")
+            needed_scope = exc.response.get("needed")
+        except Exception:
+            pass
+        if error_code == "missing_scope" and needed_scope == "groups:read":
+            response = client.conversations_list(types="public_channel")
+        else:
+            raise
     channels = response.get("channels", [])
     result = [{"id": c["id"], "name": c.get("name")} for c in channels]
     db = get_db()
@@ -211,3 +238,100 @@ def verify_request(raw_body: bytes, timestamp: str, signature: str) -> bool:
 
 def parse_event_payload(raw_body: bytes) -> dict:
     return json.loads(raw_body.decode("utf-8"))
+
+
+async def list_channel_messages(tenant_id: str, channel_id: str, limit: int = 50) -> list[dict]:
+    installation = await get_installation_by_tenant(tenant_id)
+    if not installation:
+        raise ValueError("Slack not installed")
+    if installation.get("revoked_at"):
+        raise ValueError("Slack install revoked")
+
+    client = slack_client(installation_token(installation))
+    try:
+        response = client.conversations_history(channel=channel_id, limit=max(1, min(limit, 200)))
+    except SlackApiError as exc:
+        error_code = None
+        try:
+            error_code = exc.response.get("error")
+        except Exception:
+            pass
+        if error_code == "not_in_channel":
+            try:
+                client.conversations_join(channel=channel_id)
+                response = client.conversations_history(channel=channel_id, limit=max(1, min(limit, 200)))
+            except SlackApiError as join_exc:
+                join_error = None
+                try:
+                    join_error = join_exc.response.get("error")
+                except Exception:
+                    pass
+                if join_error == "missing_scope":
+                    raise ValueError(
+                        "Slack token missing channels:join scope. Reconnect Slack integration and try again."
+                    )
+                if join_error in {"method_not_supported_for_channel_type", "not_in_channel"}:
+                    raise ValueError(
+                        "Bot is not in this channel. Invite the DecisionVault app to the channel and try again."
+                    )
+                raise ValueError(f"Slack history read failed: {join_error or 'unknown_error'}")
+        else:
+            raise ValueError(f"Slack history read failed: {error_code or 'unknown_error'}")
+    messages = response.get("messages", [])
+    result: list[dict] = []
+    for msg in reversed(messages):
+        result.append(
+            {
+                "id": msg.get("ts"),
+                "text": msg.get("text") or "",
+                "user": msg.get("user") or msg.get("bot_id") or "unknown",
+                "created_at": msg.get("ts"),
+            }
+        )
+    return result
+
+
+async def post_channel_message(tenant_id: str, channel_id: str, text: str) -> dict:
+    installation = await get_installation_by_tenant(tenant_id)
+    if not installation:
+        raise ValueError("Slack not installed")
+    if installation.get("revoked_at"):
+        raise ValueError("Slack install revoked")
+
+    client = slack_client(installation_token(installation))
+    try:
+        response = client.chat_postMessage(channel=channel_id, text=text.strip())
+    except SlackApiError as exc:
+        error_code = None
+        try:
+            error_code = exc.response.get("error")
+        except Exception:
+            pass
+        if error_code == "not_in_channel":
+            # For public channels, join and retry once.
+            try:
+                client.conversations_join(channel=channel_id)
+                response = client.chat_postMessage(channel=channel_id, text=text.strip())
+            except SlackApiError as join_exc:
+                join_error = None
+                try:
+                    join_error = join_exc.response.get("error")
+                except Exception:
+                    pass
+                if join_error == "missing_scope":
+                    raise ValueError(
+                        "Slack token missing channels:join scope. Reconnect Slack integration and try again."
+                    )
+                if join_error in {"method_not_supported_for_channel_type", "not_in_channel"}:
+                    raise ValueError(
+                        "Bot is not in this channel. Invite the DecisionVault app to the channel and try again."
+                    )
+                raise ValueError(f"Slack message send failed: {join_error or 'unknown_error'}")
+        else:
+            raise ValueError(f"Slack message send failed: {error_code or 'unknown_error'}")
+    return {
+        "id": response.get("ts"),
+        "text": text.strip(),
+        "user": "you",
+        "created_at": response.get("ts"),
+    }

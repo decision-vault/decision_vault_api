@@ -68,10 +68,13 @@ async def delete_org(
 
 
 @router.get("", response_model=list[TenantOut])
-async def list_orgs(user=Depends(get_current_user)):
+async def list_orgs(
+    q: str | None = None,
+    user=Depends(get_current_user),
+):
     if not is_super_admin(user.get("role")):
         raise HTTPException(status_code=403, detail="Forbidden")
-    tenants = await list_tenants()
+    tenants = await list_tenants(search=q)
     return [_normalize(doc) for doc in tenants]
 
 

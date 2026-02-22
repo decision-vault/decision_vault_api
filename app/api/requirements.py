@@ -125,6 +125,37 @@ async def generate_system_design_doc(
     return {"content": content}
 
 
+@router.get("/latest")
+async def get_latest_requirements_status(
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+
+    db = get_db()
+    intake = await db.requirements_intakes.find_one(
+        {
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        },
+        sort=[("updated_at", -1), ("created_at", -1)],
+    )
+    if not intake:
+        raise HTTPException(status_code=404, detail="No requirements intake found")
+
+    missing = intake.get("missing_fields") or []
+    low_quality = intake.get("low_quality_fields") or []
+    return {
+        "intake_id": str(intake["_id"]),
+        "structured_partial": intake.get("structured") or {},
+        "missing_fields": missing,
+        "low_quality_fields": low_quality,
+        "questions": intake.get("questions") or [],
+        "ready_for_prd": len(missing) == 0 and len(low_quality) == 0,
+    }
+
+
 @router.get("/{intake_id}")
 async def get_requirements_status(
     intake_id: str,

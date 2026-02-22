@@ -1,6 +1,10 @@
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from authlib.integrations.starlette_client import OAuth, OAuthError
+from bson import ObjectId
+from app.db.mongo import get_db
+from app.middleware.auth import get_current_user
+from fastapi import Depends
 
 from app.core.config import settings
 from app.schemas.auth import LoginRequest, SignupRequest, TokenResponse
@@ -29,7 +33,7 @@ def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
         value=refresh_token,
         httponly=True,
         secure=settings.secure_cookies,
-        samesite="strict",
+        samesite=settings.cookie_samesite,
         max_age=settings.refresh_token_days * 24 * 60 * 60,
         domain=settings.cookie_domain,
         path="/api/auth",
@@ -171,3 +175,23 @@ async def google_callback(request: Request):
         entity_id=str(result["user"]["_id"]),
     )
     return response
+
+
+@router.get("/session")
+async def session(user=Depends(get_current_user)):
+    db = get_db()
+    user_doc = await db.users.find_one({"_id": ObjectId(user["user_id"])})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    tenant_doc = await db.tenants.find_one({"_id": ObjectId(user["tenant_id"])})
+    return {
+        "user_id": str(user_doc["_id"]),
+        "tenant_id": str(user_doc["tenant_id"]),
+        "email": user_doc.get("email", ""),
+        "role": user_doc.get("role", ""),
+        "provider": user_doc.get("provider", ""),
+        "last_login_at": user_doc.get("last_login_at"),
+        "tenant_name": tenant_doc.get("name", "") if tenant_doc else "",
+        "tenant_slug": tenant_doc.get("slug", "") if tenant_doc else "",
+    }

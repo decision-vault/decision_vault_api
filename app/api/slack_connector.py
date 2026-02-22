@@ -1,6 +1,7 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 import httpx
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.middleware.guard import withGuard
@@ -14,6 +15,10 @@ from app.services.decision_service import create_decision_if_new
 router = APIRouter(prefix="/api/slack", tags=["slack-connector"])
 
 
+class SlackChannelMessageCreate(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4000)
+
+
 @router.get("/oauth/start")
 async def slack_oauth_start(
     tenant_id: str,
@@ -24,7 +29,7 @@ async def slack_oauth_start(
     url = (
         "https://slack.com/oauth/v2/authorize"
         f"?client_id={settings.slack_client_id}"
-        f"&scope=channels:history,channels:read,chat:write,commands"
+        f"&scope=channels:history,channels:read,channels:join,groups:read,chat:write,commands"
         f"&redirect_uri={settings.slack_redirect_uri}"
         f"&state={tenant_id}"
     )
@@ -33,6 +38,13 @@ async def slack_oauth_start(
 
 @router.get("/oauth/callback")
 async def slack_oauth_callback(code: str, state: str):
+    if not settings.slack_client_id or not settings.slack_client_secret:
+        raise HTTPException(status_code=500, detail="Slack OAuth not configured")
+    if not settings.slack_token_encryption_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing DV_SLACK_TOKEN_ENCRYPTION_KEY",
+        )
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://slack.com/api/oauth.v2.access",
@@ -46,16 +58,25 @@ async def slack_oauth_callback(code: str, state: str):
     data = response.json()
     if not data.get("ok"):
         raise HTTPException(status_code=400, detail="Slack OAuth failed")
+    if not data.get("team", {}).get("id"):
+        raise HTTPException(status_code=400, detail="Slack OAuth failed: missing team id")
+    if not data.get("access_token"):
+        raise HTTPException(status_code=400, detail="Slack OAuth failed: missing bot access token")
 
     tenant_id = state
-    await slack_service.ensure_tenant_workspace_binding(tenant_id, data["team"]["id"])
-    await slack_service.store_installation(
-        tenant_id=tenant_id,
-        team_id=data["team"]["id"],
-        team_name=data["team"].get("name"),
-        bot_token=data["access_token"],
+    try:
+        await slack_service.ensure_tenant_workspace_binding(tenant_id, data["team"]["id"])
+        await slack_service.store_installation(
+            tenant_id=tenant_id,
+            team_id=data["team"]["id"],
+            team_name=data["team"].get("name"),
+            bot_token=data["access_token"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return RedirectResponse(
+        url=f"{settings.frontend_base_url}/organizations?connector=slack&status=connected"
     )
-    return {"status": "ok"}
 
 
 @router.post("/reinstall")
@@ -67,7 +88,7 @@ async def slack_reinstall(
     url = (
         "https://slack.com/oauth/v2/authorize"
         f"?client_id={settings.slack_client_id}"
-        f"&scope=channels:history,channels:read,chat:write,commands"
+        f"&scope=channels:history,channels:read,channels:join,groups:read,chat:write,commands"
         f"&redirect_uri={settings.slack_redirect_uri}"
         f"&state={tenant_id}"
     )
@@ -109,6 +130,34 @@ async def list_channels(
         "allowed_channel_ids": installation.get("channels", []),
         "channels": channels,
     }
+
+
+@router.get("/channels/{channel_id}/messages")
+async def list_channel_messages(
+    channel_id: str,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    _guard=Depends(withGuard(feature="view_decision", orgRole="member")),
+):
+    try:
+        messages = await slack_service.list_channel_messages(request.state.tenant_id, channel_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"channel_id": channel_id, "messages": messages}
+
+
+@router.post("/channels/{channel_id}/messages")
+async def post_channel_message(
+    channel_id: str,
+    payload: SlackChannelMessageCreate,
+    request: Request,
+    _guard=Depends(withGuard(feature="edit_decision", orgRole="member")),
+):
+    try:
+        message = await slack_service.post_channel_message(request.state.tenant_id, channel_id, payload.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"channel_id": channel_id, "message": message}
 
 
 @router.get("/admin/config", response_model=SlackAdminConfigResponse)

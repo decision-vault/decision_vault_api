@@ -1,10 +1,19 @@
+import base64
+import hashlib
+
 from cryptography.fernet import Fernet
 
 from app.core.config import settings
 
 
 def _fernet(key: str) -> Fernet:
-    return Fernet(key.encode("utf-8"))
+    raw = key.encode("utf-8")
+    try:
+        return Fernet(raw)
+    except Exception:
+        # Dev-friendly fallback: derive a valid Fernet key from any input string.
+        derived = base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
+        return Fernet(derived)
 
 
 def encrypt_token(value: str) -> str:

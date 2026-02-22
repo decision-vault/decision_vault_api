@@ -29,9 +29,10 @@ def _normalize_license(doc: dict) -> dict:
 
 async def get_current_license(tenant_id: str) -> dict | None:
     db = get_db()
+    tenant_match = {"$in": [_oid(tenant_id), tenant_id]}
     license_doc = await db.licenses.find_one(
         {
-            "tenant_id": _oid(tenant_id),
+            "tenant_id": tenant_match,
             "$or": [{"deleted_at": None}, {"deleted_at": {"$exists": False}}],
         }
     )

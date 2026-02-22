@@ -54,6 +54,14 @@ REQUIRED_FIELDS = [
     "out_of_scope",
 ]
 
+LIST_PATH_FIELDS = {
+    "target_users",
+    "desired_features",
+    "success_metrics",
+    "constraints.hard_constraints",
+    "out_of_scope",
+}
+
 
 def _get_nested(structured: dict, path: str):
     current = structured
@@ -226,10 +234,13 @@ def deep_merge_structured(existing: dict, answers: dict) -> dict:
     updated = dict(existing)
     for key, value in answers.items():
         if "." in key:
-            root, leaf = key.split(".", 1)
-            updated.setdefault(root, {})
-            if isinstance(updated[root], dict):
-                updated[root][leaf] = value
+            parts = key.split(".")
+            cur = updated
+            for part in parts[:-1]:
+                if not isinstance(cur.get(part), dict):
+                    cur[part] = {}
+                cur = cur[part]
+            cur[parts[-1]] = value
         else:
             updated[key] = value
     return updated
@@ -520,6 +531,24 @@ def _sanitize_structured(structured: dict) -> dict:
     updated = structured
     for field in REQUIRED_FIELDS:
         value = _get_nested(updated, field)
+        # Coerce list-like fields from string to list before quality checks/response validation.
+        if isinstance(value, str) and field in LIST_PATH_FIELDS:
+            coerced = _extract_list(value) or []
+            parts = field.split(".")
+            if len(parts) == 1:
+                updated[parts[0]] = coerced
+            else:
+                cur = updated
+                for part in parts[:-1]:
+                    if not isinstance(cur, dict):
+                        cur = None
+                        break
+                    if not isinstance(cur.get(part), dict):
+                        cur[part] = {}
+                    cur = cur.get(part)
+                if isinstance(cur, dict):
+                    cur[parts[-1]] = coerced
+            value = _get_nested(updated, field)
         if isinstance(value, str):
             parts = field.split(".")
             if len(parts) == 1:

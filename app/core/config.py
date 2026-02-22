@@ -25,14 +25,19 @@ class Settings(BaseSettings):
     frontend_base_url: str = "http://localhost:3000"
     cors_origins: list[str] = [
         "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:4173",
         "http://localhost:8081",
         "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:4173",
         "http://127.0.0.1:8081",
     ]
     cors_allow_methods: list[str] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     cors_allow_headers: list[str] = ["*"]
 
     secure_cookies: bool = True
+    cookie_samesite: str = "none"
     cookie_domain: str | None = None
 
     session_secret: str = "change-me"
@@ -41,12 +46,17 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     stripe_price_starter: str = ""
     stripe_price_team: str = ""
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    razorpay_currency: str = "INR"
+    razorpay_amount_starter_paise: int = 0
+    razorpay_amount_team_paise: int = 0
 
-    slack_client_id: str = ""
-    slack_client_secret: str = ""
-    slack_signing_secret: str = ""
-    slack_redirect_uri: str = "http://localhost:8000/api/slack/oauth/callback"
-    slack_token_encryption_key: str = ""
+    slack_client_id: str = "10553321666597.10560383537988"
+    slack_client_secret: str = "cb7d74cc9d121c43e621ee51060fe2b5"
+    slack_signing_secret: str = "5ab2b0c892a56ee904878775de2ccca0"
+    slack_redirect_uri: str = "https://homoeomorphic-especially-felecia.ngrok-free.dev/api/slack/oauth/callback"
+    slack_token_encryption_key: str = "uoZWtkpkDu71zaMpSzHnzpso"
     slack_channel_cache_seconds: int = 300
 
     teams_client_id: str = ""
@@ -83,12 +93,15 @@ class Settings(BaseSettings):
     postgres_dsn: str = ""
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     vector_search_enabled: bool = False
-    llm_provider: str = "gemini"
-    llm_model: str = "gemini-2.0-flash"
-    llm_temperature: float = 0.0
-    llm_api_key: str = ""
+    llm_provider: str = "lmstudio"
+    llm_model: str = "qwen2-0.5b-instruct"
+    llm_temperature: float = 0.7
+    llm_api_key: str = "AIzaSyDgU2vgycUahBqvViPh9oFezpuD7L9GAgM"
+    llm_base_url: str | None = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    llm_max_input_tokens: int = 3000
+    llm_max_output_tokens: int = 1800
 
-    hf_api_token: str = "sk-lm-hx1C4UXg:NS9ilY6h8ibTNs87dWbv"
+    hf_api_token: str = "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"
     hf_model_name: str = "Qwen/Qwen2-0.5B-Instruct"
     hf_tokenizer_name: str = ""
     hf_router_base_url: str = "https://router.huggingface.co/v1"

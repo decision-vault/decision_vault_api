@@ -13,10 +13,7 @@ from app.api.example import router as example_router
 from app.api.resources import router as resources_router
 from app.api.slack import router as slack_router
 from app.api.slack_connector import router as slack_connector_router
-from app.api.teams_connector import router as teams_connector_router
-from app.api.zoom_connector import router as zoom_connector_router
-from app.api.google_chat_connector import router as google_chat_connector_router
-from app.api.custom_connector import router as custom_connector_router
+from app.api.connectors import router as connectors_router
 from app.api.uploads import router as uploads_router
 from app.api.webhooks import router as webhooks_router
 from app.api.why_query import router as why_query_router
@@ -24,6 +21,10 @@ from app.api.orgs import router as orgs_router
 from app.api.projects import router as projects_router
 from app.api.hf_inference import router as hf_inference_router
 from app.api.requirements import router as requirements_router
+from app.api.messenger import router as messenger_router
+from app.api.prd import router as prd_router
+from app.services.prd_pg_service import ensure_prd_table
+from app.services.llm_usage_service import ensure_usage_table
 from app.services.requirements_service import validate_structured, compute_ready_for_prd
 from bson import ObjectId
 from app.core.errors import LicenseError
@@ -37,6 +38,7 @@ app = FastAPI(title=settings.app_name)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.(ngrok-free\.app|ngrok-free\.dev|ngrok\.io|ngrok\.app)",
     allow_credentials=True,
     allow_methods=settings.cors_allow_methods,
     allow_headers=settings.cors_allow_headers,
@@ -127,21 +129,6 @@ async def startup() -> None:
         await db.requirements_intakes.create_index([("tenant_id", 1), ("project_id", 1)], unique=True)
     await db.requirements_history.create_index([("tenant_id", 1), ("project_id", 1), ("version", 1)], unique=True)
     await db.prd_documents.create_index([("intake_id", 1), ("version", 1)], unique=True)
-    await db.teams_installations.create_index("tenant_id", unique=True)
-    await db.teams_subscriptions.create_index("tenant_id", unique=True)
-    await db.teams_delta_links.create_index([("tenant_id", 1), ("team_id", 1), ("channel_id", 1)], unique=True)
-    await db.zoom_installations.create_index("tenant_id", unique=True)
-    await db.zoom_installations.create_index("account_id", unique=True)
-    await db.zoom_webhook_events.create_index("event_id", unique=True)
-    await db.google_chat_installations.create_index("tenant_id", unique=True)
-    await db.google_chat_installations.create_index("domain", unique=True)
-    await db.custom_connector_keys.create_index("tenant_id", unique=True)
-    await db.custom_connector_requests.create_index([("tenant_id", 1), ("external_id", 1)], unique=True)
-    await db.custom_connector_requests.create_index("created_at")
-    await db.custom_connector_oauth_clients.create_index("tenant_id", unique=True)
-    await db.custom_connector_oauth_clients.create_index("client_id", unique=True)
-    await db.custom_connector_deliveries.create_index([("tenant_id", 1), ("created_at", -1)])
-    await db.custom_connector_retry_queue.create_index([("tenant_id", 1), ("next_attempt_at", 1)])
     if settings.enable_rate_limiter:
         try:
             redis_client = redis.from_url(settings.redis_url)
@@ -151,8 +138,28 @@ async def startup() -> None:
                 "startup_warning %s",
                 {"event": "rate_limiter_disabled", "reason": "redis_unavailable"},
             )
-    await db.google_chat_webhook_events.create_index("event_id", unique=True)
-    await db.google_chat_thread_activity.create_index([("tenant_id", 1), ("thread_id", 1)], unique=True)
+    await db.project_channels.create_index([("tenant_id", 1), ("project_id", 1), ("slug", 1)], unique=True)
+    await db.project_channels.create_index([("tenant_id", 1), ("project_id", 1), ("created_at", 1)])
+    await db.project_threads.create_index(
+        [("tenant_id", 1), ("project_id", 1), ("channel_id", 1), ("slug", 1)],
+        unique=True,
+    )
+    await db.project_threads.create_index([("tenant_id", 1), ("project_id", 1), ("channel_id", 1), ("created_at", 1)])
+    await db.project_messages.create_index(
+        [("tenant_id", 1), ("project_id", 1), ("channel_id", 1), ("thread_id", 1), ("created_at", 1)]
+    )
+    await db.project_channel_favorites.create_index(
+        [("tenant_id", 1), ("project_id", 1), ("channel_id", 1), ("user_id", 1)],
+        unique=True,
+    )
+    try:
+        await ensure_prd_table()
+        await ensure_usage_table()
+    except RuntimeError:
+        logger.warning(
+            "startup_warning %s",
+            {"event": "postgres_optional_tables_disabled", "reason": "postgres_unavailable_or_not_configured"},
+        )
 
 
 app.include_router(auth_router)
@@ -162,10 +169,7 @@ app.include_router(example_router)
 app.include_router(resources_router)
 app.include_router(slack_connector_router)
 app.include_router(slack_router)
-app.include_router(teams_connector_router)
-app.include_router(zoom_connector_router)
-app.include_router(google_chat_connector_router)
-app.include_router(custom_connector_router)
+app.include_router(connectors_router)
 app.include_router(uploads_router)
 app.include_router(webhooks_router)
 app.include_router(why_query_router)
@@ -173,6 +177,8 @@ app.include_router(orgs_router)
 app.include_router(projects_router)
 app.include_router(hf_inference_router)
 app.include_router(requirements_router)
+app.include_router(messenger_router)
+app.include_router(prd_router)
 
 
 @app.get("/health")

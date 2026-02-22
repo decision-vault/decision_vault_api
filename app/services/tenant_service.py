@@ -25,9 +25,12 @@ async def get_tenant(tenant_id: str) -> dict | None:
     return serialize_doc(doc) if doc else None
 
 
-async def list_tenants(limit: int = 100) -> list[dict]:
+async def list_tenants(limit: int = 100, search: str | None = None) -> list[dict]:
     db = get_db()
-    cursor = db.tenants.find({}).sort("created_at", -1).limit(limit)
+    query: dict = {}
+    if search:
+        query["name"] = {"$regex": search, "$options": "i"}
+    cursor = db.tenants.find(query).sort("created_at", -1).limit(limit)
     return [serialize_doc(doc) async for doc in cursor]
 
 

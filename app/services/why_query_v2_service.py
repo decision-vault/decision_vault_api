@@ -6,7 +6,8 @@ from typing import Iterable
 from bson import ObjectId
 
 from app.db.mongo import get_db
-from app.services.decision_embedding_service import generate_embedding, search_similar_decisions
+from app.services.cache_service import build_cache_key, cache_get, cache_set
+from app.services.decision_embedding_service import generate_embedding_cached, search_similar_decisions
 
 
 PROPOSAL_KEYWORDS = [
@@ -87,12 +88,22 @@ async def run_why_query_v2(
     limit: int = 5,
     threshold: float = 0.6,
 ) -> dict:
+    normalized_query = " ".join(query.split()).strip().lower()
+    cache_key = build_cache_key(
+        feature="why_query_v2",
+        tenant_id=tenant_id,
+        normalized_input=f"{project_id}:{normalized_query}",
+    )
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
     related_decisions: list[dict] = []
 
     exact_matches = await _keyword_search(tenant_id, project_id, query, limit)
     related_decisions.extend(exact_matches)
 
-    query_embedding = generate_embedding(query)
+    query_embedding = await generate_embedding_cached(tenant_id, query)
     semantic_matches = await search_similar_decisions(
         tenant_id=tenant_id,
         project_id=project_id,
@@ -125,4 +136,5 @@ async def run_why_query_v2(
         response["suggestion"] = "This looks like a new proposal. Consider capturing it as a decision."
         response["suggested_decision_template"] = _suggested_template(query)
 
+    await cache_set(cache_key, response, 24 * 60 * 60)
     return response

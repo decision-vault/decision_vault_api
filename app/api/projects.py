@@ -10,6 +10,7 @@ from app.services.project_service import (
     delete_project,
     get_project,
     list_projects,
+    restore_project,
     update_project,
 )
 from app.db.mongo import get_db
@@ -29,6 +30,8 @@ def _normalize(doc: dict) -> dict:
 @router.get("", response_model=list[ProjectOut])
 async def list_projects_route(
     request: Request,
+    q: str | None = None,
+    status: str | None = None,
     user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
 ):
     db = get_db()
@@ -42,7 +45,12 @@ async def list_projects_route(
     project_ids = [str(doc["project_id"]) for doc in memberships]
     if not project_ids:
         return []
-    projects = await list_projects(user.get("tenant_id"), project_ids=project_ids)
+    projects = await list_projects(
+        user.get("tenant_id"),
+        project_ids=project_ids,
+        search=q,
+        status=status,
+    )
     return [_normalize(doc) for doc in projects]
 
 
@@ -114,3 +122,24 @@ async def delete_project_route(
         entity_id=project_id,
     )
     return {"status": "deleted"}
+
+
+@router.post("/{project_id}/restore")
+async def restore_project_route(
+    project_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", projectRole="project_admin")),
+):
+    restored, reason = await restore_project(request.state.tenant_id, project_id)
+    if not restored:
+        if reason == "Project not found":
+            raise HTTPException(status_code=404, detail=reason)
+        raise HTTPException(status_code=400, detail=reason)
+    await log_event(
+        tenant_id=request.state.tenant_id,
+        actor_id=user.get("user_id"),
+        action="project.restored",
+        entity_type="project",
+        entity_id=project_id,
+    )
+    return {"status": "restored"}

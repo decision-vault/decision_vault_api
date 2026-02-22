@@ -135,17 +135,30 @@ async def signup(tenant_name: str, email: str, password: str) -> dict:
 
 async def login(tenant_id: str | None, tenant_slug: str | None, email: str, password: str) -> dict:
     db = get_db()
+    tenant_id = (tenant_id or "").strip() or None
+    tenant_slug = (tenant_slug or "").strip() or None
     tenant_query = _tenant_query(tenant_id, tenant_slug)
-    if not tenant_query:
-        raise ValueError("Tenant identifier required")
+    user = None
+    tenant = None
 
-    tenant = await db.tenants.find_one(tenant_query)
-    if not tenant:
-        raise ValueError("Tenant not found")
+    if tenant_query:
+        tenant = await db.tenants.find_one(tenant_query)
+        if not tenant:
+            raise ValueError("Tenant not found")
+        user = await db.users.find_one({"tenant_id": tenant["_id"], "email": email.lower()})
+    else:
+        # Empty tenant identifier is allowed; resolve tenant only when the email is unique.
+        users = await db.users.find({"email": email.lower()}).limit(2).to_list(length=2)
+        if len(users) > 1:
+            raise ValueError("Tenant identifier required")
+        if len(users) == 1:
+            user = users[0]
+            tenant = await db.tenants.find_one({"_id": user["tenant_id"]})
 
-    user = await db.users.find_one({"tenant_id": tenant["_id"], "email": email.lower()})
     if not user:
         raise ValueError("Invalid credentials")
+    if not tenant:
+        raise ValueError("Tenant not found")
 
     if "password_hash" not in user or not verify_password(password, user["password_hash"]):
         raise ValueError("Invalid credentials")

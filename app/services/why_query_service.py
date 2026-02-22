@@ -39,6 +39,15 @@ class WhyQueryState(TypedDict):
     confidence: str
 
 
+def _compress_context_lines(value: str | None, max_lines: int = 3) -> str | None:
+    if not value:
+        return None
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if not lines:
+        lines = [part.strip() for part in value.split(". ") if part.strip()]
+    return "\n".join(lines[:max_lines]) if lines else None
+
+
 def _normalize_query(text: str) -> str:
     return " ".join(text.strip().split())
 
@@ -88,7 +97,7 @@ async def retrieve_decisions(state: WhyQueryState) -> WhyQueryState:
     cursor = (
         db.decisions.find(query_filter)
         .sort("decided_at", -1)
-        .limit(10)
+        .limit(5)
     )
     decisions = []
     async for row in cursor:
@@ -102,9 +111,9 @@ async def retrieve_decisions(state: WhyQueryState) -> WhyQueryState:
                 decision_id=str(row.get("_id")),
                 title=row.get("title") or "",
                 statement=row.get("statement") or "",
-                context=row.get("context"),
-                alternatives=row.get("alternatives"),
-                risks=row.get("risks"),
+                context=_compress_context_lines(row.get("context"), 3),
+                alternatives=None,
+                risks=None,
                 source_url=row.get("source_url") or "",
                 decided_at=decided_date if decided_at else None,
             )

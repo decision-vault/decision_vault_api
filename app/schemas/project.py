@@ -20,5 +20,9 @@ class ProjectOut(BaseModel):
     name: str
     slug: str
     description: Optional[str] = None
+    status: Optional[str] = None
+    status_message: Optional[str] = None
+    can_restore: Optional[bool] = None
+    restore_available_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
