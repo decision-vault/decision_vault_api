@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import TypedDict
@@ -69,6 +70,86 @@ def _extract_token_usage(message) -> int:
     usage = getattr(message, "response_metadata", {}) or {}
     token_usage = usage.get("token_usage") or usage.get("usage") or {}
     return int(token_usage.get("total_tokens") or 0)
+
+
+def _strip_code_fence(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_json_block(text: str) -> str:
+    cleaned = _strip_code_fence(text)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return cleaned
+    return cleaned[start : end + 1]
+
+
+def _collect_strings(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        v = _collapse_ws(value)
+        return [v] if v else []
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            parts.extend(_collect_strings(item))
+        return parts
+    if isinstance(value, dict):
+        parts: list[str] = []
+        # Prefer common content-bearing keys first.
+        for key in ("content", "title", "text", "description", "value"):
+            if key in value:
+                parts.extend(_collect_strings(value.get(key)))
+        # Then recurse remaining keys.
+        for k, v in value.items():
+            if k in {"content", "title", "text", "description", "value"}:
+                continue
+            parts.extend(_collect_strings(v))
+        return parts
+    return []
+
+
+def _to_list_str(value) -> list[str]:
+    seen: set[str] = set()
+    items: list[str] = []
+    for item in _collect_strings(value):
+        if item and item not in seen:
+            seen.add(item)
+            items.append(item)
+    return items
+
+
+def _coerce_structured_output(raw_text: str) -> PRDStructuredOutput:
+    data = json.loads(_extract_json_block(raw_text))
+    if not isinstance(data, dict):
+        raise ValueError("Structured output must be a JSON object")
+
+    exec_summary = _to_list_str(data.get("executive_summary"))
+    problem_stmt = _to_list_str(data.get("problem_statement"))
+    target_users = _to_list_str(data.get("target_users"))
+    feature_overview = _to_list_str(data.get("feature_overview"))
+    technical_considerations = _to_list_str(data.get("technical_considerations"))
+    risks = _to_list_str(data.get("risks"))
+    success_metrics = _to_list_str(data.get("success_metrics"))
+
+    normalized = {
+        "executive_summary": exec_summary[0] if exec_summary else "Insufficient information provided",
+        "problem_statement": problem_stmt[0] if problem_stmt else "Insufficient information provided",
+        "target_users": target_users or ["Insufficient information provided"],
+        "feature_overview": feature_overview or ["Insufficient information provided"],
+        "technical_considerations": technical_considerations or ["Insufficient information provided"],
+        "risks": risks or ["Insufficient information provided"],
+        "success_metrics": success_metrics or ["Insufficient information provided"],
+    }
+    return PRDStructuredOutput.model_validate(normalized)
 
 
 def _llm(model_name: str, max_tokens: int) -> ChatOpenAI:
@@ -321,9 +402,20 @@ async def _invoke_structured(
         try:
             return parser.parse(content), usage_tokens, parse_retries
         except Exception as exc:
-            last_err = exc
-            parse_retries += 1
-            logger.warning("prd_parse_retry", extra={"attempt": attempt + 1, "error": str(exc)})
+            # LM Studio can return malformed-but-recoverable JSON-like payloads.
+            try:
+                coerced = _coerce_structured_output(content)
+                logger.warning("prd_parse_coerced attempt=%s", attempt + 1)
+                return coerced, usage_tokens, parse_retries
+            except Exception as coerce_exc:
+                last_err = coerce_exc
+                parse_retries += 1
+                logger.warning(
+                    "prd_parse_retry attempt=%s parse_error=%s coerce_error=%s",
+                    attempt + 1,
+                    str(exc),
+                    str(coerce_exc),
+                )
 
     raise ValueError(f"Failed to parse structured PRD output: {last_err}")
 
@@ -498,6 +590,11 @@ async def run_prd_pipeline(payload: dict, timeout_seconds: int = 60) -> dict:
         else settings.hf_openai_model if provider == "huggingface"
         else settings.llm_model
     )
+    logger.warning(
+        "prd_pipeline_start provider=%s model=%s",
+        provider,
+        resolved_model,
+    )
     normalized_input = "\n".join(
         [
             f"provider={provider}",
@@ -514,9 +611,11 @@ async def run_prd_pipeline(payload: dict, timeout_seconds: int = 60) -> dict:
         tenant_id=payload["tenant_id"],
         normalized_input=normalized_input,
     )
-    cached = await cache_get(cache_key)
-    if cached:
-        return cached
+    if provider != "lmstudio":
+        cached = await cache_get(cache_key)
+        if cached:
+            logger.warning("prd_pipeline_cache_hit provider=%s model=%s", provider, resolved_model)
+            return cached
 
     graph = build_prd_graph()
     initial_state: PRDGraphState = {
@@ -549,5 +648,6 @@ async def run_prd_pipeline(payload: dict, timeout_seconds: int = 60) -> dict:
         "confidence_score": result.get("confidence_score", 0.0),
         "sections_generated": result.get("sections_generated", []),
     }
-    await cache_set(cache_key, output, PRD_CACHE_TTL_SECONDS)
+    if provider != "lmstudio":
+        await cache_set(cache_key, output, PRD_CACHE_TTL_SECONDS)
     return output

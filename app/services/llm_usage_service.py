@@ -19,6 +19,7 @@ async def ensure_usage_table() -> None:
     db = get_db()
     await db.llm_usage_logs.create_index([("tenant_id", 1), ("created_at", -1)])
     await db.llm_usage_logs.create_index([("feature", 1), ("created_at", -1)])
+    await db.llm_usage_logs.create_index([("stage_name", 1), ("created_at", -1)])
 
 
 async def log_llm_usage(
@@ -28,16 +29,20 @@ async def log_llm_usage(
     input_tokens: int,
     output_tokens: int,
     tenant_id: str,
+    stage_name: str | None = None,
+    retry_count: int = 0,
 ) -> None:
     db = get_db()
     cost = estimate_cost(model, input_tokens, output_tokens)
     await db.llm_usage_logs.insert_one(
         {
             "feature": feature,
+            "stage_name": stage_name,
             "model": model,
             "input_tokens": int(input_tokens),
             "output_tokens": int(output_tokens),
             "estimated_cost": float(cost),
+            "retry_count": int(retry_count),
             "tenant_id": tenant_id,
             "created_at": datetime.now(timezone.utc),
         }

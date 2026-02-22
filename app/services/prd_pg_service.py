@@ -30,3 +30,47 @@ async def store_prd_version(project_id: str, created_by: str, markdown_content: 
         "created_by": created_by,
         "created_at": created_at,
     }
+
+
+async def get_latest_prd_version(project_id: str) -> dict | None:
+    db = get_db()
+    doc = await db.prd_versions.find_one({"project_id": project_id}, sort=[("version_number", -1)])
+    if not doc:
+        return None
+    return {
+        "project_id": doc.get("project_id"),
+        "version_number": doc.get("version_number"),
+        "created_by": doc.get("created_by"),
+        "created_at": doc.get("created_at"),
+        "markdown_content": doc.get("markdown_content"),
+    }
+
+
+async def list_prd_versions(project_id: str) -> list[dict]:
+    db = get_db()
+    cursor = db.prd_versions.find({"project_id": project_id}).sort("version_number", -1)
+    versions: list[dict] = []
+    async for doc in cursor:
+        versions.append(
+            {
+                "project_id": doc.get("project_id"),
+                "version_number": doc.get("version_number"),
+                "created_by": doc.get("created_by"),
+                "created_at": doc.get("created_at"),
+            }
+        )
+    return versions
+
+
+async def get_prd_version(project_id: str, version_number: int) -> dict | None:
+    db = get_db()
+    doc = await db.prd_versions.find_one({"project_id": project_id, "version_number": version_number})
+    if not doc:
+        return None
+    return {
+        "project_id": doc.get("project_id"),
+        "version_number": doc.get("version_number"),
+        "created_by": doc.get("created_by"),
+        "created_at": doc.get("created_at"),
+        "markdown_content": doc.get("markdown_content"),
+    }

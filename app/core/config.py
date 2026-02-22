@@ -94,12 +94,13 @@ class Settings(BaseSettings):
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     vector_search_enabled: bool = False
     llm_provider: str = "lmstudio"
-    llm_model: str = "qwen2-0.5b-instruct"
-    llm_temperature: float = 0.7
+    llm_model: str = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+    llm_temperature: float = 0.2
     llm_api_key: str = "AIzaSyDgU2vgycUahBqvViPh9oFezpuD7L9GAgM"
     llm_base_url: str | None = "https://generativelanguage.googleapis.com/v1beta/openai/"
     llm_max_input_tokens: int = 3000
     llm_max_output_tokens: int = 1800
+    prd_generation_timeout_seconds: int = 180
 
     hf_api_token: str = "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"
     hf_model_name: str = "Qwen/Qwen2-0.5B-Instruct"
@@ -107,7 +108,7 @@ class Settings(BaseSettings):
     hf_router_base_url: str = "https://router.huggingface.co/v1"
     hf_openai_model: str = "Qwen/Qwen2.5-7B-Instruct:together"
     lmstudio_base_url: str = "http://localhost:1234/api/v1"
-    lmstudio_model: str = "qwen2-0.5b-instruct"
+    lmstudio_model: str = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
     remote_provider: str = "lmstudio"
     lmstudio_chat_path: str = "/chat"
     model_run_mode: str = "remote"

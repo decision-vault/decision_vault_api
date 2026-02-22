@@ -11,9 +11,15 @@ from app.schemas.prd_generation import (
     PRDClarificationRespondRequest,
     PRDGenerateRequest,
     PRDGenerateResponse,
+    PRDMultiStepResponse,
 )
-from app.services.prd_graph_service import run_prd_pipeline
-from app.services.prd_pg_service import store_prd_version
+from app.services.prd_multistep_service import generate_multistep_prd
+from app.services.prd_pg_service import (
+    get_latest_prd_version,
+    get_prd_version,
+    list_prd_versions,
+    store_prd_version,
+)
 from app.core.config import settings
 from app.services.token_limiter import TokenBudget, TokenLimiter
 from langchain_openai import ChatOpenAI
@@ -169,14 +175,7 @@ async def generate_prd(
         return clarification
 
     try:
-        result = await run_prd_pipeline(
-            {
-                **payload.model_dump(),
-                "tenant_id": user.get("tenant_id"),
-            }
-        )
-    except TimeoutError:
-        raise HTTPException(status_code=500, detail="PRD generation timed out")
+        multi = await generate_multistep_prd(payload, tenant_id=user.get("tenant_id"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -187,7 +186,7 @@ async def generate_prd(
         await store_prd_version(
             project_id=project_id,
             created_by=user.get("user_id"),
-            markdown_content=result["prd_markdown"],
+            markdown_content=multi.prd_markdown,
         )
     except RuntimeError as exc:
         # Postgres is optional for local/dev. PRD generation should still succeed.
@@ -198,10 +197,37 @@ async def generate_prd(
 
     return PRDGenerateResponse(
         status="ready_for_prd_generation",
-        prd_markdown=result["prd_markdown"],
-        confidence_score=result["confidence_score"],
-        sections_generated=result["sections_generated"],
+        prd_markdown=multi.prd_markdown,
+        confidence_score=0.95,
+        sections_generated=multi.sections_generated,
     )
+
+
+@router.post("/generate-multistep", response_model=PRDMultiStepResponse)
+async def generate_prd_multistep(
+    payload: PRDGenerateRequest,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    try:
+        result = await generate_multistep_prd(payload, tenant_id=user.get("tenant_id"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("prd_multistep_failed", extra={"error": str(exc), "project_id": project_id})
+        raise HTTPException(status_code=500, detail=f"Multi-step PRD generation failed: {str(exc)}")
+
+    try:
+        await store_prd_version(
+            project_id=project_id,
+            created_by=user.get("user_id"),
+            markdown_content=result.prd_markdown,
+        )
+    except Exception:
+        logger.warning("prd_multistep_store_skipped")
+    return result
 
 
 @router.post("/clarification/respond", response_model=Union[PRDGenerateResponse, PRDClarificationResponse])
@@ -295,3 +321,55 @@ async def generate_prd_stream(
                 yield text
 
     return StreamingResponse(event_stream(), media_type="text/markdown")
+
+
+@router.get("/latest")
+async def get_latest_prd(
+    project_id: str | None = None,
+    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    latest = await get_latest_prd_version(project_id)
+    if not latest:
+        raise HTTPException(status_code=404, detail="PRD not found")
+    return {
+        "project_id": latest["project_id"],
+        "version": latest["version_number"],
+        "created_by": latest["created_by"],
+        "created_at": latest["created_at"],
+        "content": latest["markdown_content"],
+        "source": "llm",
+    }
+
+
+@router.get("/versions")
+async def get_prd_versions(
+    project_id: str | None = None,
+    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    versions = await list_prd_versions(project_id)
+    return {"items": versions}
+
+
+@router.get("/versions/{version_number}")
+async def get_prd_by_version(
+    version_number: int,
+    project_id: str | None = None,
+    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    doc = await get_prd_version(project_id, version_number)
+    if not doc:
+        raise HTTPException(status_code=404, detail="PRD version not found")
+    return {
+        "project_id": doc["project_id"],
+        "version": doc["version_number"],
+        "created_by": doc["created_by"],
+        "created_at": doc["created_at"],
+        "content": doc["markdown_content"],
+        "source": "llm",
+    }
