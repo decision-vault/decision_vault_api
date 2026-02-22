@@ -73,3 +73,6 @@ class PRDMultiStepResponse(BaseModel):
     sections_generated: list[str]
     total_tokens_used: int
     prd_markdown: str
+    required_sections: list[str] = []
+    missing_sections: list[str] = []
+    has_all_required_sections: bool = True

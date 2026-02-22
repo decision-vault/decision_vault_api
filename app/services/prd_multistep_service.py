@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import ast
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Type
+from typing import Any, Awaitable, Callable, Type
 
 import httpx
 from langchain_openai import ChatOpenAI
@@ -22,13 +23,22 @@ logger = logging.getLogger("decisionvault.prd.multistep")
 STRICT_PROMPT = (
     "Only use provided information. Do not invent statistics, integrations, or technologies. "
     "If data is missing, write 'Insufficient information provided'. "
-    "Write concrete, professional content and avoid placeholder wording."
+    "Write concrete, professional content and avoid placeholder wording. "
+    "Never output JSON fragments, key names, braces, or escaped markdown."
 )
 
 DETAIL_PROMPT = (
     "Expand depth and clarity while preserving meaning. "
     "Do not introduce new facts not present in input. "
     "Prefer implementation-ready wording."
+)
+
+DOC_STYLE_GUIDE = (
+    "Output must be professional PRD-quality Markdown-ready prose, never JSON-like prose. "
+    "Each section value must be clean plain text suitable for direct insertion into Markdown. "
+    "No braces, no quoted key/value output, no code fences, no escaped newlines (\\\\n), and no LaTeX commands. "
+    "Use concise subheadings, dense but readable bullets, and measurable language when present in input. "
+    "Use plain Markdown tables only when requested."
 )
 
 KNOWN_INTEGRATIONS = {
@@ -46,6 +56,137 @@ KNOWN_INTEGRATIONS = {
 
 MAX_STAGE_INPUT_TOKENS = 3000
 MAX_STAGE_OUTPUT_TOKENS = 3000
+REQUIRED_SECTION_HEADINGS = [
+    "# 1. Product Requirements Document (PRD)",
+    "## 1.1 DecisionVault — Stage 1: Decision History Core",
+    "## 2. Executive Summary",
+    "## 3. Problem Statement",
+    "### 3.1 The Core Problem",
+    "### 3.2 Why Existing Tools Fail",
+    "### 3.3 Success Will Mean",
+    "## 4. Objectives and Success Metrics",
+    "### 4.1 Primary Objective",
+    "### 4.2 Success Metrics (Stage 1 MVP)",
+    "### 4.3 Leading Indicators (Early Validation)",
+    "## 5. Target Users and Personas",
+    "### 5.1 Primary Persona: Sarah — Engineering Lead",
+    "### 5.2 Secondary Persona: David — Product Manager",
+    "### 5.3 Tertiary Persona: Maya — Startup CTO/Founder",
+    "## 6. Product Scope: Stage 1 Features",
+    "### 6.1 In Scope (Must Have for MVP)",
+    "#### 6.1.1 Decision Capture System",
+    "##### Slack Thread Capture",
+    "##### Manual Document Upload",
+    "##### Structured Decision Entry Form",
+    "#### 6.1.2 Decision Record Storage",
+    "##### Immutable Decision Records",
+    "##### Versioning System",
+    "##### Evidence Linking",
+    "#### 6.1.3 Decision Timeline View",
+    "##### Project Timeline",
+    "##### Evolution Visualization",
+    "#### 6.1.4 \"Why Did We...?\" Query System",
+    "##### Natural Language Search",
+    "##### Evidence-First Results",
+    "##### Query Analytics (Admin View)",
+    "#### 6.1.5 Multi-Tenant Foundation",
+    "##### Tenant Architecture",
+    "##### Project Hierarchy",
+    "##### User Management",
+    "##### Role-Based Access Control (RBAC)",
+    "#### 6.1.6 License and Trial System",
+    "##### Trial Mode",
+    "##### Paid Licensing",
+    "##### Billing Integration",
+    "### 6.2 Out of Scope (Stage 1)",
+    "## 7. User Stories and Use Cases",
+    "### 7.1 Epic 1: Decision Capture",
+    "#### US-1.1",
+    "#### US-1.2",
+    "#### US-1.3",
+    "### 7.2 Epic 2: Decision Retrieval",
+    "#### US-2.1",
+    "#### US-2.2",
+    "#### US-2.3",
+    "### 7.3 Epic 3: Decision Management",
+    "#### US-3.1",
+    "#### US-3.2",
+    "#### US-3.3",
+    "### 7.4 Epic 4: Multi-Tenant Administration",
+    "#### US-4.1",
+    "#### US-4.2",
+    "#### US-4.3",
+    "## 8. Technical Architecture",
+    "### 8.1 System Architecture Overview",
+    "### 8.2 Data Model (Core Entities)",
+    "#### Tenant (Organization)",
+    "#### User",
+    "#### Project",
+    "#### Decision (Core Entity)",
+    "#### Decision Relationship",
+    "#### Integration (Slack)",
+    "### 8.3 API Endpoints (Key Routes)",
+    "#### Authentication",
+    "#### Organizations",
+    "#### Projects",
+    "#### Decisions",
+    "#### Search",
+    "#### Integrations",
+    "#### Billing",
+    "### 8.4 Slack Integration Architecture",
+    "#### OAuth Flow",
+    "#### Event Subscription Flow",
+    "#### Slack Bot Permissions Required",
+    "#### Data Privacy",
+    "### 8.5 Security and Compliance",
+    "#### Data Security",
+    "#### Authentication",
+    "#### Access Control",
+    "#### Compliance Considerations (Future)",
+    "## 9. User Interface Design",
+    "### 9.1 Key Screens (Wireframe Descriptions)",
+    "#### Dashboard (Post-Login Landing)",
+    "#### Project Timeline View",
+    "#### Decision Detail View",
+    "#### Search Results View",
+    "#### Create/Edit Decision Form",
+    "#### Admin Settings",
+    "#### Billing Page",
+    "### 9.2 Design Principles",
+    "## 10. Dependencies and Integrations",
+    "### 10.1 External Dependencies",
+    "### 10.2 API Rate Limits and Handling",
+    "### 10.3 Fallback Strategies",
+    "## 11. Non-Functional Requirements",
+    "### 11.1 Performance",
+    "### 11.2 Scalability",
+    "### 11.3 Reliability",
+    "### 11.4 Security",
+    "### 11.5 Compliance",
+    "## 12. Testing Strategy",
+    "### 12.1 Test Coverage Goals",
+    "### 12.2 Key Test Scenarios",
+    "#### Decision Capture",
+    "#### Search and Retrieval",
+    "#### Multi-Tenancy",
+    "#### Billing",
+    "#### Performance",
+    "## 13. Launch Plan",
+    "### 13.1 Pre-Launch (Weeks -4 to -1)",
+    "### 13.2 Launch (Week 0)",
+    "### 13.3 Post-Launch Monitoring",
+    "## 14. Open Questions and Assumptions",
+    "### 14.1 Open Questions",
+    "### 14.2 Assumptions",
+    "### 14.3 Risks and Mitigations",
+    "## 15. Success Criteria and Definition of Done",
+    "### 15.1 Stage 1 is \"Done\" When",
+    "### 15.2 Stage 1 is \"Successful\" When (6-Month Post-Launch)",
+    "## 16. Appendix",
+    "### 16.1 Glossary",
+    "### 16.2 References",
+    "## 17. Document Change Log",
+]
 
 
 class TextSection(BaseModel):
@@ -65,8 +206,13 @@ class StageRunResult:
 
 
 class PRDOrchestrator:
-    def __init__(self, tenant_id: str):
+    def __init__(
+        self,
+        tenant_id: str,
+        progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
+    ):
         self.tenant_id = tenant_id
+        self.progress_cb = progress_cb
         self.total_tokens_used = 0
         self.sections_generated: list[str] = []
         self.limiter = TokenLimiter(
@@ -98,6 +244,54 @@ class PRDOrchestrator:
         return cleaned[start : end + 1]
 
     @staticmethod
+    def _sanitize_generated_text(text: str) -> str:
+        s = (text or "").strip()
+        if not s:
+            return "Insufficient information provided"
+        s = s.replace("\\n", "\n").replace("\\t", " ")
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+        s = re.sub(r'^\{\s*"?(content|text|items)"?\s*:\s*', "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\}\s*$", "", s)
+        s = s.strip().strip('"').strip("'")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s or "Insufficient information provided"
+
+    async def _emit_progress(self, event: dict[str, Any]) -> None:
+        if not self.progress_cb:
+            return
+        maybe = self.progress_cb(event)
+        if hasattr(maybe, "__await__"):
+            await maybe
+
+    @classmethod
+    def _fallback_parse(cls, schema: Type[BaseModel], raw_text: str) -> BaseModel:
+        cleaned = cls._strip_code_fence(raw_text)
+        if schema is TextSection:
+            return TextSection(content=cls._sanitize_generated_text(cleaned))
+        if schema is ListSection:
+            lines = [line.strip(" -•\t") for line in cleaned.splitlines()]
+            items = [line for line in lines if line]
+            if not items:
+                items = [part.strip() for part in re.split(r"[;\n]", cleaned) if part.strip()]
+            cleaned_items = [cls._sanitize_generated_text(i) for i in items]
+            return ListSection(items=cleaned_items or ["Insufficient information provided"])
+        return schema.model_validate({})
+
+    @classmethod
+    def _parse_stage_output(cls, schema: Type[BaseModel], raw_text: str) -> BaseModel:
+        candidate = cls._extract_json_block(raw_text)
+        try:
+            parsed = json.loads(candidate)
+            return cls._coerce_stage_output(schema, parsed)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(candidate)
+                return cls._coerce_stage_output(schema, parsed)
+            except Exception:
+                return cls._fallback_parse(schema, raw_text)
+
+    @staticmethod
     def _collect_strings(value: Any) -> list[str]:
         if value is None:
             return []
@@ -127,21 +321,24 @@ class PRDOrchestrator:
     def _coerce_stage_output(cls, schema: Type[BaseModel], parsed_json: Any) -> BaseModel:
         if schema is TextSection:
             if isinstance(parsed_json, dict) and isinstance(parsed_json.get("content"), str):
-                return TextSection(content=parsed_json["content"].strip())
+                return TextSection(content=cls._sanitize_generated_text(parsed_json["content"]))
             strings = cls._collect_strings(parsed_json)
-            return TextSection(content=(strings[0] if strings else "Insufficient information provided"))
+            return TextSection(
+                content=cls._sanitize_generated_text(strings[0] if strings else "Insufficient information provided")
+            )
 
         if schema is ListSection:
             if isinstance(parsed_json, dict) and isinstance(parsed_json.get("items"), list):
-                items = [str(item).strip() for item in parsed_json["items"] if str(item).strip()]
+                items = [cls._sanitize_generated_text(str(item)) for item in parsed_json["items"] if str(item).strip()]
                 return ListSection(items=items or ["Insufficient information provided"])
             items = cls._collect_strings(parsed_json)
             deduped: list[str] = []
             seen: set[str] = set()
             for item in items:
-                if item not in seen:
-                    seen.add(item)
-                    deduped.append(item)
+                cleaned_item = cls._sanitize_generated_text(item)
+                if cleaned_item not in seen:
+                    seen.add(cleaned_item)
+                    deduped.append(cleaned_item)
             return ListSection(items=deduped or ["Insufficient information provided"])
 
         return schema.model_validate(parsed_json)
@@ -267,6 +464,12 @@ class PRDOrchestrator:
         stage_instructions: str,
     ) -> StageRunResult:
         logger.warning("prd_multistep_stage_start stage=%s", stage_name)
+        await self._emit_progress(
+            {
+                "stage": stage_name,
+                "status": "running",
+            }
+        )
         source_payload = payload
         input_json = json.dumps(source_payload, ensure_ascii=True)
         input_tokens = self._estimate_tokens(input_json)
@@ -278,6 +481,7 @@ class PRDOrchestrator:
 
         base_prompt = (
             f"System Rules: {STRICT_PROMPT}\\n"
+            f"Document Standard: {DOC_STYLE_GUIDE}\\n"
             f"Stage: {stage_name}\\n"
             f"Instructions: {stage_instructions}\\n"
             f"Return JSON object only with this schema keys: {', '.join(schema.model_fields.keys())}.\\n"
@@ -293,8 +497,7 @@ class PRDOrchestrator:
             raw_text, used_tokens, model_name = await self._invoke_llm(prompt, MAX_STAGE_OUTPUT_TOKENS)
             self.total_tokens_used += used_tokens
             try:
-                raw_json = json.loads(self._extract_json_block(raw_text))
-                parsed = self._coerce_stage_output(schema, raw_json)
+                parsed = self._parse_stage_output(schema, raw_text)
                 if self._detect_hallucination(input_json, parsed.model_dump_json()):
                     if attempt == 0:
                         retry_count = 1
@@ -316,11 +519,27 @@ class PRDOrchestrator:
                     used_tokens,
                     retry_count,
                 )
+                await self._emit_progress(
+                    {
+                        "stage": stage_name,
+                        "status": "completed",
+                        "input_tokens": input_tokens,
+                        "output_tokens": max(1, used_tokens - input_tokens),
+                        "retry_count": retry_count,
+                    }
+                )
                 return StageRunResult(parsed, input_tokens, used_tokens, retry_count)
             except Exception as exc:
                 last_error = exc
                 retry_count = 1
 
+        await self._emit_progress(
+            {
+                "stage": stage_name,
+                "status": "failed",
+                "error": str(last_error),
+            }
+        )
         raise ValueError(f"{stage_name} failed: {last_error}")
 
     async def _run_text_section(self, stage_name: str, payload: dict[str, Any], instruction: str) -> str:
@@ -338,22 +557,22 @@ class PRDOrchestrator:
             "executive_summary": await self._run_text_section(
                 "stage_1_executive_summary",
                 {"title": payload["title"], "problem_statement": payload["problem_statement"], "target_users": payload["target_users"]},
-                "Write Executive Summary in 2 short paragraphs: product purpose and user value.",
+                "Write Executive Summary in 2-3 paragraphs. Include: product purpose, value proposition, and stage focus.",
             ),
             "problem_statement": await self._run_text_section(
                 "stage_2_problem_statement",
                 {"problem_statement": payload["problem_statement"], "additional_notes": payload.get("additional_notes", "")},
-                "Write a clear Problem Statement in 4-6 sentences with scope and pain points.",
+                "Write Problem Statement with two subparts: 'The Core Problem' and 'Why Existing Approaches Fail'.",
             ),
             "target_users_personas": await self._run_list_section(
                 "stage_3_target_users_personas",
                 {"target_users": payload["target_users"], "problem_statement": payload["problem_statement"]},
-                "List 4-8 Target Users & Personas as concise business-oriented bullets.",
+                "List 3-6 personas. Each item should include role + pain + goal in one line.",
             ),
             "objectives_success_metrics": await self._run_list_section(
                 "stage_4_objectives_success_metrics",
                 {"features": payload["features"], "additional_notes": payload.get("additional_notes", "")},
-                "List 5-8 Objectives & Success Metrics, each measurable when possible.",
+                "List 5-10 objectives and success metrics. Prefer measurable targets if present in input.",
             ),
         }
         if self._should_run_detail_pass(payload):
@@ -382,12 +601,12 @@ class PRDOrchestrator:
             "feature_overview": await self._run_list_section(
                 "stage_5_feature_overview",
                 {"features": payload["features"], "problem_statement": payload["problem_statement"]},
-                "List 6-10 Feature Overview items as implementation-ready bullets.",
+                "List 8-12 Feature Overview items, grouped logically by capability in wording.",
             ),
             "out_of_scope": await self._run_list_section(
                 "stage_6_out_of_scope",
                 {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List Out of Scope items only when explicitly implied by input.",
+                "List Out-of-scope items only if explicitly mentioned or safely implied by provided context.",
             ),
         }
         if self._should_run_detail_pass(payload):
@@ -404,17 +623,17 @@ class PRDOrchestrator:
             "architecture_decisions": await self._run_list_section(
                 "stage_7_architecture_decisions",
                 {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List 5-10 Architecture Decisions based on provided stack/features only.",
+                "List 6-12 Architecture Decisions using decision-style phrasing (what + why).",
             ),
             "technical_architecture": await self._run_list_section(
                 "stage_8_technical_architecture",
                 {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List 6-10 Technical Architecture details (components, data flow, integration boundaries).",
+                "List 8-12 Technical Architecture details: components, data flow, and integration boundaries.",
             ),
             "deployment_strategy": await self._run_list_section(
                 "stage_9_deployment_strategy",
                 {"additional_notes": payload.get("additional_notes", "")},
-                "List 4-8 Deployment Strategy details (environment, rollout, observability hooks).",
+                "List 5-10 Deployment Strategy details: environment, release flow, rollback, observability.",
             ),
         }
         if self._should_run_detail_pass(payload):
@@ -437,12 +656,12 @@ class PRDOrchestrator:
             "non_functional_requirements": await self._run_list_section(
                 "stage_10_non_functional_requirements",
                 {"additional_notes": payload.get("additional_notes", ""), "problem_statement": payload["problem_statement"]},
-                "List 6-10 Non-Functional Requirements with concrete quality expectations.",
+                "List 8-12 Non-Functional Requirements with concrete quality expectations.",
             ),
             "security_compliance": await self._run_list_section(
                 "stage_11_security_compliance",
                 {"additional_notes": payload.get("additional_notes", "")},
-                "List 4-8 Security & Compliance requirements from provided context only.",
+                "List 6-10 Security & Compliance requirements from provided context only.",
             ),
         }
         if self._should_run_detail_pass(payload):
@@ -459,22 +678,22 @@ class PRDOrchestrator:
             "scalability_considerations": await self._run_list_section(
                 "stage_12_scalability_considerations",
                 {"features": payload["features"], "additional_notes": payload.get("additional_notes", "")},
-                "List 4-8 Scalability Considerations aligned with expected usage.",
+                "List 6-10 Scalability Considerations aligned with expected usage patterns.",
             ),
             "risks_mitigation": await self._run_list_section(
                 "stage_13_risks_mitigation",
                 {"features": payload["features"], "additional_notes": payload.get("additional_notes", "")},
-                "List 5-10 Risks & Mitigation items as paired actionable bullets.",
+                "List 6-12 Risks & Mitigation items as actionable paired bullets.",
             ),
             "constraints": await self._run_list_section(
                 "stage_14_constraints",
                 {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List 4-8 delivery/business/technical Constraints.",
+                "List 6-10 delivery/business/technical constraints.",
             ),
             "definition_of_done": await self._run_list_section(
                 "stage_15_definition_of_done",
                 {"features": payload["features"], "problem_statement": payload["problem_statement"]},
-                "List 6-10 Definition of Done criteria that are testable and release-ready.",
+                "List 8-12 Definition of Done criteria that are verifiable and release-ready.",
             ),
         }
         if self._should_run_detail_pass(payload):
@@ -496,6 +715,78 @@ class PRDOrchestrator:
     def _bullets(items: list[str]) -> str:
         clean = [item.strip() for item in items if item and item.strip()]
         return "\\n".join([f"- {item}" for item in clean]) if clean else "- Insufficient information provided"
+
+    @staticmethod
+    def _phased_plan(
+        feature_items: list[str],
+        architecture_items: list[str],
+        nonfunctional_items: list[str],
+    ) -> str:
+        f = [x for x in feature_items if x and x.strip()]
+        a = [x for x in architecture_items if x and x.strip()]
+        n = [x for x in nonfunctional_items if x and x.strip()]
+        p1 = f[:3] + a[:2]
+        p2 = f[3:7] + a[2:5]
+        p3 = f[7:10] + n[:3]
+        return (
+            "### Phase 1 — Foundation\n"
+            + ("\n".join([f"- {x}" for x in (p1 or ["Insufficient information provided"])]) + "\n\n")
+            + "### Phase 2 — Core Workflow Completion\n"
+            + ("\n".join([f"- {x}" for x in (p2 or ["Insufficient information provided"])]) + "\n\n")
+            + "### Phase 3 — Hardening and Launch Readiness\n"
+            + ("\n".join([f"- {x}" for x in (p3 or ["Insufficient information provided"])]))
+        )
+
+    @staticmethod
+    def _metrics_table(metrics: list[str]) -> str:
+        rows = [m for m in metrics if m and m.strip()]
+        if not rows:
+            return "| Metric | Target |\n|---|---|\n| Insufficient information provided | Insufficient information provided |"
+        lines = ["| Metric | Target |", "|---|---|"]
+        for item in rows[:10]:
+            parts = [p.strip() for p in re.split(r"[:\-]", item, maxsplit=1) if p.strip()]
+            if len(parts) == 2:
+                metric, target = parts
+            else:
+                metric, target = item.strip(), "As provided"
+            lines.append(f"| {metric} | {target} |")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _risk_table(risks: list[str]) -> str:
+        rows = [r for r in risks if r and r.strip()]
+        if not rows:
+            return "| Risk | Mitigation |\n|---|---|\n| Insufficient information provided | Insufficient information provided |"
+        lines = ["| Risk | Mitigation |", "|---|---|"]
+        for item in rows[:10]:
+            parts = [p.strip() for p in re.split(r"[:\-]", item, maxsplit=1) if p.strip()]
+            if len(parts) == 2:
+                risk, mitigation = parts
+            else:
+                risk, mitigation = item.strip(), "Mitigation to be defined during implementation"
+            lines.append(f"| {risk} | {mitigation} |")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _feature_blocks(features: list[str]) -> str:
+        clean = [f for f in features if f and f.strip()]
+        if not clean:
+            return "### Core Features\n- Insufficient information provided"
+        lines: list[str] = []
+        for idx, item in enumerate(clean[:12], 1):
+            lines.append(f"### {idx}. {item[:80]}")
+            lines.append(f"- {item}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _user_stories(features: list[str]) -> str:
+        clean = [f for f in features if f and f.strip()]
+        if not clean:
+            return "- As a user, I need clear decision records so I can understand context."
+        lines: list[str] = []
+        for idx, item in enumerate(clean[:6], 1):
+            lines.append(f"- **US-{idx}:** As a user, I want {item.lower()} so the team can preserve decision context.")
+        return "\n".join(lines)
 
     @staticmethod
     def _clean_list_items(items: list[str], max_items: int = 10) -> list[str]:
@@ -575,102 +866,323 @@ class PRDOrchestrator:
         project_title: str,
     ) -> str:
         today = datetime.now(timezone.utc).strftime("%B %d, %Y")
-        markdown = f"""# Product Requirements Document (PRD)
-{project_title} — Version 1.0
-Date: {today}
-Status: Draft for Development
+        stage_title = "DecisionVault — Stage 1: Decision History Core"
+        features = feature.get("feature_overview", [])
+        arch = architecture.get("architecture_decisions", [])
+        tech = architecture.get("technical_architecture", [])
+        deploy = architecture.get("deployment_strategy", [])
+        nfr = nonfunctional.get("non_functional_requirements", [])
+        sec = nonfunctional.get("security_compliance", [])
+        risks = risk.get("risks_mitigation", [])
+        constraints = risk.get("constraints", [])
+        dod = risk.get("definition_of_done", [])
+        scalability = risk.get("scalability_considerations", [])
+        users = core.get("target_users_personas", [])
+        metrics = core.get("objectives_success_metrics", [])
+        out_scope = feature.get("out_of_scope", [])
 
-## 1. Executive Summary
+        markdown = f"""# 1. Product Requirements Document (PRD)
+## 1.1 {stage_title}
+**Version:** 1.0
+**Date:** {today}
+**Status:** Draft for Development
+**Owner:** Product Team
+**Contributors:** Engineering, Design
+
+## 2. Executive Summary
 {core['executive_summary']}
 
-## 2. Problem Statement
+## 3. Problem Statement
+### 3.1 The Core Problem
 {core['problem_statement']}
 
-## 3. Target Users & Personas
-{self._bullets(core['target_users_personas'])}
+### 3.2 Why Existing Tools Fail
+{self._bullets(out_scope)}
 
-## 4. Objectives & Success Metrics
-{self._bullets(core['objectives_success_metrics'])}
+### 3.3 Success Will Mean
+{self._bullets(metrics)}
 
-## 5. Feature Overview (Stage 1)
-{self._bullets(feature['feature_overview'])}
+## 4. Objectives and Success Metrics
+### 4.1 Primary Objective
+{core['executive_summary']}
 
-## 6. Out of Scope
-{self._bullets(feature['out_of_scope'])}
+### 4.2 Success Metrics (Stage 1 MVP)
+{self._metrics_table(metrics)}
 
-## 7. Architecture Decisions
-{self._bullets(architecture['architecture_decisions'])}
+### 4.3 Leading Indicators (Early Validation)
+{self._bullets(metrics)}
+
+## 5. Target Users and Personas
+### 5.1 Primary Persona: Sarah — Engineering Lead
+{self._bullets(users[:2] or users)}
+
+### 5.2 Secondary Persona: David — Product Manager
+{self._bullets(users[2:4] or users)}
+
+### 5.3 Tertiary Persona: Maya — Startup CTO/Founder
+{self._bullets(users[4:6] or users)}
+
+## 6. Product Scope: Stage 1 Features
+### 6.1 In Scope (Must Have for MVP)
+#### 6.1.1 Decision Capture System
+##### Slack Thread Capture
+{self._bullets(features[:2])}
+##### Manual Document Upload
+{self._bullets(features[2:4])}
+##### Structured Decision Entry Form
+{self._bullets(features[4:6])}
+
+#### 6.1.2 Decision Record Storage
+##### Immutable Decision Records
+{self._bullets(features[6:7])}
+##### Versioning System
+{self._bullets(features[7:8])}
+##### Evidence Linking
+{self._bullets(features[8:9])}
+
+#### 6.1.3 Decision Timeline View
+##### Project Timeline
+{self._bullets(features[9:10])}
+##### Evolution Visualization
+{self._bullets(features[10:11])}
+
+#### 6.1.4 "Why Did We...?" Query System
+##### Natural Language Search
+{self._bullets(features[11:12])}
+##### Evidence-First Results
+{self._bullets(features[:1])}
+##### Query Analytics (Admin View)
+{self._bullets(metrics[:2])}
+
+#### 6.1.5 Multi-Tenant Foundation
+##### Tenant Architecture
+{self._bullets(arch[:2])}
+##### Project Hierarchy
+{self._bullets(arch[2:4])}
+##### User Management
+{self._bullets(arch[4:5])}
+##### Role-Based Access Control (RBAC)
+{self._bullets(arch[5:6])}
+
+#### 6.1.6 License and Trial System
+##### Trial Mode
+{self._bullets(constraints[:2])}
+##### Paid Licensing
+{self._bullets(constraints[2:4])}
+##### Billing Integration
+{self._bullets(constraints[4:5])}
+
+### 6.2 Out of Scope (Stage 1)
+{self._bullets(out_scope)}
+
+## 7. User Stories and Use Cases
+### 7.1 Epic 1: Decision Capture
+#### US-1.1
+{features[0] if len(features) > 0 else "Insufficient information provided"}
+#### US-1.2
+{features[1] if len(features) > 1 else "Insufficient information provided"}
+#### US-1.3
+{features[2] if len(features) > 2 else "Insufficient information provided"}
+
+### 7.2 Epic 2: Decision Retrieval
+#### US-2.1
+{features[3] if len(features) > 3 else "Insufficient information provided"}
+#### US-2.2
+{features[4] if len(features) > 4 else "Insufficient information provided"}
+#### US-2.3
+{features[5] if len(features) > 5 else "Insufficient information provided"}
+
+### 7.3 Epic 3: Decision Management
+#### US-3.1
+{features[6] if len(features) > 6 else "Insufficient information provided"}
+#### US-3.2
+{features[7] if len(features) > 7 else "Insufficient information provided"}
+#### US-3.3
+{features[8] if len(features) > 8 else "Insufficient information provided"}
+
+### 7.4 Epic 4: Multi-Tenant Administration
+#### US-4.1
+{features[9] if len(features) > 9 else "Insufficient information provided"}
+#### US-4.2
+{features[10] if len(features) > 10 else "Insufficient information provided"}
+#### US-4.3
+{features[11] if len(features) > 11 else "Insufficient information provided"}
 
 ## 8. Technical Architecture
-{self._bullets(architecture['technical_architecture'])}
+### 8.1 System Architecture Overview
+{self._bullets(arch)}
 
-## 9. Deployment Strategy
-{self._bullets(architecture['deployment_strategy'])}
+### 8.2 Data Model (Core Entities)
+#### Tenant (Organization)
+{self._bullets(arch[:1])}
+#### User
+{self._bullets(arch[1:2] or arch[:1])}
+#### Project
+{self._bullets(arch[2:3] or arch[:1])}
+#### Decision (Core Entity)
+{self._bullets(arch[3:4] or arch[:1])}
+#### Decision Relationship
+{self._bullets(arch[4:5] or arch[:1])}
+#### Integration (Slack)
+{self._bullets(arch[5:6] or arch[:1])}
 
-## 10. Non-Functional Requirements
-{self._bullets(nonfunctional['non_functional_requirements'])}
+### 8.3 API Endpoints (Key Routes)
+#### Authentication
+{self._bullets(tech[:2])}
+#### Organizations
+{self._bullets(tech[2:4] or tech[:2])}
+#### Projects
+{self._bullets(tech[4:6] or tech[:2])}
+#### Decisions
+{self._bullets(tech[6:8] or tech[:2])}
+#### Search
+{self._bullets(tech[8:9] or tech[:2])}
+#### Integrations
+{self._bullets(tech[9:11] or tech[:2])}
+#### Billing
+{self._bullets(tech[11:12] or tech[:2])}
 
-## 11. Security & Compliance
-{self._bullets(nonfunctional['security_compliance'])}
+### 8.4 Slack Integration Architecture
+#### OAuth Flow
+{self._bullets(deploy[:1])}
+#### Event Subscription Flow
+{self._bullets(deploy[1:2] or deploy[:1])}
+#### Slack Bot Permissions Required
+{self._bullets(deploy[2:3] or deploy[:1])}
+#### Data Privacy
+{self._bullets(sec[:1] or deploy[:1])}
 
-## 12. Scalability Considerations
-{self._bullets(risk['scalability_considerations'])}
+### 8.5 Security and Compliance
+#### Data Security
+{self._bullets(sec[:2] or sec)}
+#### Authentication
+{self._bullets(sec[2:3] or sec[:1])}
+#### Access Control
+{self._bullets(sec[3:4] or sec[:1])}
+#### Compliance Considerations (Future)
+{self._bullets(sec[4:6] or sec[:1])}
 
-## 13. Risks & Mitigation
-{self._bullets(risk['risks_mitigation'])}
+## 9. User Interface Design
+### 9.1 Key Screens (Wireframe Descriptions)
+#### Dashboard (Post-Login Landing)
+{self._bullets(features[:1])}
+#### Project Timeline View
+{self._bullets(features[1:2] or features[:1])}
+#### Decision Detail View
+{self._bullets(features[2:3] or features[:1])}
+#### Search Results View
+{self._bullets(features[3:4] or features[:1])}
+#### Create/Edit Decision Form
+{self._bullets(features[4:5] or features[:1])}
+#### Admin Settings
+{self._bullets(features[5:6] or features[:1])}
+#### Billing Page
+{self._bullets(features[6:7] or features[:1])}
 
-## 14. Constraints
-{self._bullets(risk['constraints'])}
+### 9.2 Design Principles
+{self._bullets(features[:4])}
 
-## 15. Definition of Done
-{self._bullets(risk['definition_of_done'])}
+## 10. Dependencies and Integrations
+### 10.1 External Dependencies
+{self._bullets(tech[:5])}
 
----END OF PRD---
+### 10.2 API Rate Limits and Handling
+{self._bullets(deploy[:3])}
+
+### 10.3 Fallback Strategies
+{self._bullets(deploy[3:6] or deploy)}
+
+## 11. Non-Functional Requirements
+### 11.1 Performance
+{self._bullets(nfr[:3])}
+
+### 11.2 Scalability
+{self._bullets(scalability)}
+
+### 11.3 Reliability
+{self._bullets(nfr[3:5] or nfr)}
+
+### 11.4 Security
+{self._bullets(sec[:3])}
+
+### 11.5 Compliance
+{self._bullets(sec[3:6] or sec)}
+
+## 12. Testing Strategy
+### 12.1 Test Coverage Goals
+{self._metrics_table(metrics)}
+
+### 12.2 Key Test Scenarios
+#### Decision Capture
+{self._bullets(features[:2])}
+#### Search and Retrieval
+{self._bullets(features[2:4] or features[:2])}
+#### Multi-Tenancy
+{self._bullets(arch[:2])}
+#### Billing
+{self._bullets(constraints[:2])}
+#### Performance
+{self._bullets(nfr[:2])}
+
+## 13. Launch Plan
+### 13.1 Pre-Launch (Weeks -4 to -1)
+{self._bullets(deploy[:3])}
+
+### 13.2 Launch (Week 0)
+{self._bullets(deploy[3:6] or deploy)}
+
+### 13.3 Post-Launch Monitoring
+{self._bullets(metrics)}
+
+## 14. Open Questions and Assumptions
+### 14.1 Open Questions
+- Which assumptions require stakeholder confirmation before implementation?
+- Which dependencies are highest risk for schedule variance?
+
+### 14.2 Assumptions
+- Assumptions are derived only from provided input context.
+- Missing details are marked as insufficient information.
+
+### 14.3 Risks and Mitigations
+{self._risk_table(risks)}
+
+## 15. Success Criteria and Definition of Done
+### 15.1 Stage 1 is "Done" When
+{self._bullets(dod)}
+
+### 15.2 Stage 1 is "Successful" When (6-Month Post-Launch)
+{self._bullets(metrics)}
+
+## 16. Appendix
+### 16.1 Glossary
+- Decision Record: structured, evidence-linked record of a team decision.
+- Evidence Link: original source artifact URL (message/thread/document).
+- Tenant: organization-level isolated workspace.
+
+### 16.2 References
+- [1] User-provided requirement context and structured inputs.
+- [2] DecisionVault internal product notes supplied in this session.
+
+## 17. Document Change Log
+| Version | Date | Author | Changes |
+|---------|------|--------|---------|
+| 1.0 | {today} | Product Team | Initial generated PRD draft |
 """
 
-        required_headings = [
-            "## 1. Executive Summary",
-            "## 2. Problem Statement",
-            "## 3. Target Users & Personas",
-            "## 4. Objectives & Success Metrics",
-            "## 5. Feature Overview (Stage 1)",
-            "## 6. Out of Scope",
-            "## 7. Architecture Decisions",
-            "## 8. Technical Architecture",
-            "## 9. Deployment Strategy",
-            "## 10. Non-Functional Requirements",
-            "## 11. Security & Compliance",
-            "## 12. Scalability Considerations",
-            "## 13. Risks & Mitigation",
-            "## 14. Constraints",
-            "## 15. Definition of Done",
-        ]
-        missing = [h for h in required_headings if h not in markdown]
+        missing = [h for h in REQUIRED_SECTION_HEADINGS if h not in markdown]
         if missing:
             raise ValueError(f"Missing required sections: {missing}")
 
-        self.sections_generated = [
-            "Executive Summary",
-            "Problem Statement",
-            "Target Users & Personas",
-            "Objectives & Success Metrics",
-            "Feature Overview (Stage 1)",
-            "Out of Scope",
-            "Architecture Decisions",
-            "Technical Architecture",
-            "Deployment Strategy",
-            "Non-Functional Requirements",
-            "Security & Compliance",
-            "Scalability Considerations",
-            "Risks & Mitigation",
-            "Constraints",
-            "Definition of Done",
-        ]
+        self.sections_generated = REQUIRED_SECTION_HEADINGS.copy()
         return markdown
 
 
-async def generate_multistep_prd(payload: PRDGenerateRequest, tenant_id: str) -> PRDMultiStepResponse:
-    orchestrator = PRDOrchestrator(tenant_id=tenant_id)
+async def generate_multistep_prd(
+    payload: PRDGenerateRequest,
+    tenant_id: str,
+    progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
+) -> PRDMultiStepResponse:
+    orchestrator = PRDOrchestrator(tenant_id=tenant_id, progress_cb=progress_cb)
 
     shared_payload = {
         "title": payload.title,
@@ -701,4 +1213,7 @@ async def generate_multistep_prd(payload: PRDGenerateRequest, tenant_id: str) ->
         sections_generated=orchestrator.sections_generated,
         total_tokens_used=orchestrator.total_tokens_used,
         prd_markdown=markdown,
+        required_sections=REQUIRED_SECTION_HEADINGS,
+        missing_sections=[],
+        has_all_required_sections=True,
     )

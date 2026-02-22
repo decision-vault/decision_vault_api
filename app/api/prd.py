@@ -1,6 +1,9 @@
 from typing import Union
 import logging
 import httpx
+import asyncio
+from datetime import datetime, timezone
+from bson import ObjectId
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -23,6 +26,7 @@ from app.services.prd_pg_service import (
 from app.core.config import settings
 from app.services.token_limiter import TokenBudget, TokenLimiter
 from langchain_openai import ChatOpenAI
+from app.db.mongo import get_db
 
 
 router = APIRouter(prefix="/api/prd", tags=["prd"])
@@ -31,6 +35,25 @@ logger = logging.getLogger("decisionvault.prd.api")
 
 PRIMARY_ORDER = ["project_name", "problem_statement", "target_users", "desired_features"]
 TOTAL_REQUIRED_FIELDS = 4
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_oid(value: str, field_name: str) -> ObjectId:
+    try:
+        return ObjectId(value)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
+
+
+def _as_aware_dt(value) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def _resolve_llm_stream_config() -> tuple[str, str, str | None]:
@@ -161,6 +184,155 @@ def _apply_clarification_answers(
     )
 
 
+async def _append_run_event(run_id: ObjectId, event: dict) -> None:
+    db = get_db()
+    now = _utcnow()
+    stage = event.get("stage")
+    status = event.get("status")
+    if not stage:
+        return
+    if status == "running":
+        # Set run started_at only once (first running stage).
+        await db.prd_runs.update_one(
+            {"_id": run_id, "started_at": None},
+            {"$set": {"started_at": now}},
+        )
+        await db.prd_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "running",
+                    "updated_at": now,
+                },
+                "$push": {
+                    "events": {"at": now, **event},
+                    "steps": {
+                        "stage": stage,
+                        "status": "running",
+                        "started_at": now,
+                    },
+                },
+            },
+        )
+        return
+
+    if status in {"completed", "failed"}:
+        await db.prd_runs.update_one(
+            {"_id": run_id, "steps.stage": stage},
+            {
+                "$set": {
+                    "updated_at": now,
+                    "steps.$.status": status,
+                    "steps.$.ended_at": now,
+                    "steps.$.input_tokens": event.get("input_tokens"),
+                    "steps.$.output_tokens": event.get("output_tokens"),
+                    "steps.$.retry_count": event.get("retry_count", 0),
+                    "steps.$.error": event.get("error"),
+                },
+                "$push": {"events": {"at": now, **event}},
+            },
+        )
+        return
+
+    await db.prd_runs.update_one(
+        {"_id": run_id},
+        {"$set": {"updated_at": now}, "$push": {"events": {"at": now, **event}}},
+    )
+
+
+async def _run_prd_job(
+    run_id: ObjectId,
+    payload: PRDGenerateRequest,
+    project_id: str,
+    tenant_id: str,
+    created_by: str,
+) -> None:
+    db = get_db()
+    try:
+        result = await generate_multistep_prd(
+            payload,
+            tenant_id=tenant_id,
+            progress_cb=lambda ev: _append_run_event(run_id, ev),
+        )
+        stored = await store_prd_version(
+            project_id=project_id,
+            created_by=created_by,
+            markdown_content=result.prd_markdown,
+        )
+        await db.prd_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "updated_at": _utcnow(),
+                    "completed_at": _utcnow(),
+                    "result": {
+                        "pages_estimated": result.pages_estimated,
+                        "sections_generated": result.sections_generated,
+                        "required_sections": result.required_sections,
+                        "missing_sections": result.missing_sections,
+                        "has_all_required_sections": result.has_all_required_sections,
+                        "total_tokens_used": result.total_tokens_used,
+                        "prd_markdown": result.prd_markdown,
+                        "version": stored.get("version_number"),
+                    },
+                }
+            },
+        )
+    except Exception as exc:
+        logger.exception("prd_run_failed run_id=%s project_id=%s", str(run_id), project_id)
+        await db.prd_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "updated_at": _utcnow(),
+                    "completed_at": _utcnow(),
+                    "error": str(exc),
+                }
+            },
+        )
+
+
+async def _enqueue_prd_run(
+    *,
+    payload: PRDGenerateRequest,
+    project_id: str,
+    tenant_id: str,
+    created_by: str,
+) -> dict:
+    db = get_db()
+    run_id = ObjectId()
+    now = _utcnow()
+    run_doc = {
+        "_id": run_id,
+        "tenant_id": _as_oid(tenant_id, "tenant_id"),
+        "project_id": _as_oid(project_id, "project_id"),
+        "created_by": created_by,
+        "status": "queued",
+        "request": payload.model_dump(),
+        "steps": [],
+        "events": [{"at": now, "status": "queued"}],
+        "error": None,
+        "result": None,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "completed_at": None,
+    }
+    await db.prd_runs.insert_one(run_doc)
+    asyncio.create_task(
+        _run_prd_job(
+            run_id=run_id,
+            payload=payload,
+            project_id=project_id,
+            tenant_id=tenant_id,
+            created_by=created_by,
+        )
+    )
+    return {"run_id": str(run_id), "status": "queued"}
+
+
 @router.post("/generate", response_model=Union[PRDGenerateResponse, PRDClarificationResponse])
 async def generate_prd(
     payload: PRDGenerateRequest,
@@ -214,6 +386,12 @@ async def generate_prd_multistep(
     try:
         result = await generate_multistep_prd(payload, tenant_id=user.get("tenant_id"))
     except ValueError as exc:
+        logger.warning(
+            "prd_multistep_bad_request project_id=%s tenant_id=%s detail=%s",
+            project_id,
+            user.get("tenant_id"),
+            str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("prd_multistep_failed", extra={"error": str(exc), "project_id": project_id})
@@ -230,14 +408,118 @@ async def generate_prd_multistep(
     return result
 
 
-@router.post("/clarification/respond", response_model=Union[PRDGenerateResponse, PRDClarificationResponse])
+@router.post("/generate-multistep/run")
+async def generate_prd_multistep_run(
+    payload: PRDGenerateRequest,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    clarification = _build_clarification(payload)
+    if clarification and clarification.questions:
+        logger.warning(
+            "prd_multistep_run_clarification_required project_id=%s tenant_id=%s completion_score=%s",
+            project_id,
+            user.get("tenant_id"),
+            clarification.completion_score,
+        )
+        return {
+            "status": clarification.status,
+            "questions": clarification.questions,
+            "completion_score": clarification.completion_score,
+        }
+    return await _enqueue_prd_run(
+        payload=payload,
+        project_id=project_id,
+        tenant_id=user.get("tenant_id"),
+        created_by=user.get("user_id"),
+    )
+
+
+@router.get("/runs/{run_id}")
+async def get_prd_run_status(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    db = get_db()
+    doc = await db.prd_runs.find_one(
+        {
+            "_id": _as_oid(run_id, "run_id"),
+            "tenant_id": _as_oid(user.get("tenant_id"), "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    now = _utcnow()
+    steps = doc.get("steps", [])
+    step_timings: list[dict] = []
+    for step in steps:
+        started_at = _as_aware_dt(step.get("started_at"))
+        ended_at = _as_aware_dt(step.get("ended_at"))
+        duration_seconds: float | None = None
+        if started_at and ended_at:
+            duration_seconds = round((ended_at - started_at).total_seconds(), 3)
+        elif started_at and step.get("status") == "running":
+            duration_seconds = round((now - started_at).total_seconds(), 3)
+        step_timings.append(
+            {
+                **step,
+                "duration_seconds": duration_seconds,
+            }
+        )
+
+    run_started_at = _as_aware_dt(doc.get("started_at")) or _as_aware_dt(doc.get("created_at"))
+    run_completed_at = _as_aware_dt(doc.get("completed_at"))
+    total_elapsed_seconds: float | None = None
+    if run_started_at and run_completed_at:
+        total_elapsed_seconds = round((run_completed_at - run_started_at).total_seconds(), 3)
+    elif run_started_at and doc.get("status") in {"queued", "running"}:
+        total_elapsed_seconds = round((now - run_started_at).total_seconds(), 3)
+
+    return {
+        "run_id": str(doc["_id"]),
+        "status": doc.get("status"),
+        "steps": step_timings,
+        "error": doc.get("error"),
+        "result": doc.get("result"),
+        "timing": {
+            "total_elapsed_seconds": total_elapsed_seconds,
+        },
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+        "started_at": doc.get("started_at"),
+        "completed_at": doc.get("completed_at"),
+    }
+
+
+@router.post("/clarification/respond")
 async def respond_prd_clarification(
     payload: PRDClarificationRespondRequest,
     project_id: str | None = None,
     user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
     merged = _apply_clarification_answers(payload.draft, payload.answers)
-    return await generate_prd(merged, project_id, user)
+    clarification = _build_clarification(merged)
+    if clarification and clarification.questions:
+        return {
+            "status": clarification.status,
+            "questions": clarification.questions,
+            "completion_score": clarification.completion_score,
+        }
+    return await _enqueue_prd_run(
+        payload=merged,
+        project_id=project_id,
+        tenant_id=user.get("tenant_id"),
+        created_by=user.get("user_id"),
+    )
 
 
 @router.post("/generate/stream")

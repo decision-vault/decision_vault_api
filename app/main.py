@@ -129,6 +129,8 @@ async def startup() -> None:
         await db.requirements_intakes.create_index([("tenant_id", 1), ("project_id", 1)], unique=True)
     await db.requirements_history.create_index([("tenant_id", 1), ("project_id", 1), ("version", 1)], unique=True)
     await db.prd_documents.create_index([("intake_id", 1), ("version", 1)], unique=True)
+    await db.prd_runs.create_index([("tenant_id", 1), ("project_id", 1), ("created_at", -1)])
+    await db.prd_runs.create_index([("project_id", 1), ("status", 1), ("updated_at", -1)])
     if settings.enable_rate_limiter:
         try:
             redis_client = redis.from_url(settings.redis_url)
