@@ -1,12 +1,16 @@
-from typing import Union
+from typing import Literal, Union
 import logging
 import httpx
 import asyncio
 from datetime import datetime, timezone
 from bson import ObjectId
+import re
+from pathlib import Path
+import struct
+import zlib
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from app.middleware.guard import withGuard
 from app.schemas.prd_generation import (
@@ -35,6 +39,304 @@ logger = logging.getLogger("decisionvault.prd.api")
 
 PRIMARY_ORDER = ["project_name", "problem_statement", "target_users", "desired_features"]
 TOTAL_REQUIRED_FIELDS = 4
+WATERMARK_TEXT = "DecisionVault"
+PDF_LOGO_PATH = Path(__file__).resolve().parents[3] / "decision_vault_ui" / "src" / "assets" / "logo.png"
+RUN_STALE_TIMEOUT_SECONDS = 120
+_ACTIVE_PRD_TASKS: set[asyncio.Task] = set()
+_ACTIVE_PRD_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
+
+
+def _strip_markdown(md: str) -> str:
+    text = md or ""
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _pdf_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _pdf_right_aligned_x(text: str, font_size: float, right_x: float = 562.0) -> float:
+    # Helvetica average glyph width approximation for simple right-alignment.
+    estimated_width = max(1.0, len(text)) * font_size * 0.52
+    return right_x - estimated_width
+
+
+def _pdf_centered_x(text: str, font_size: float, page_width: float = 612.0) -> float:
+    estimated_width = max(1.0, len(text)) * font_size * 0.52
+    return (page_width - estimated_width) / 2.0
+
+
+def _decode_png_rgba_for_pdf(png_path: Path) -> dict | None:
+    if not png_path.exists():
+        return None
+    data = png_path.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+
+    pos = 8
+    width = height = bit_depth = color_type = None
+    idat_parts: list[bytes] = []
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        chunk_type = data[pos + 4 : pos + 8]
+        chunk_data = data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", chunk_data)
+        elif chunk_type == b"IDAT":
+            idat_parts.append(chunk_data)
+        elif chunk_type == b"IEND":
+            break
+
+    if not width or not height or bit_depth != 8 or color_type != 6:
+        return None
+
+    raw = zlib.decompress(b"".join(idat_parts))
+    bpp = 4
+    stride = width * bpp
+    out = bytearray(height * stride)
+    src = 0
+    prev = bytearray(stride)
+
+    for row in range(height):
+        filter_type = raw[src]
+        src += 1
+        scan = bytearray(raw[src : src + stride])
+        src += stride
+        recon = bytearray(stride)
+
+        if filter_type == 0:
+            recon[:] = scan
+        elif filter_type == 1:
+            for i in range(stride):
+                left = recon[i - bpp] if i >= bpp else 0
+                recon[i] = (scan[i] + left) & 0xFF
+        elif filter_type == 2:
+            for i in range(stride):
+                up = prev[i]
+                recon[i] = (scan[i] + up) & 0xFF
+        elif filter_type == 3:
+            for i in range(stride):
+                left = recon[i - bpp] if i >= bpp else 0
+                up = prev[i]
+                recon[i] = (scan[i] + ((left + up) // 2)) & 0xFF
+        elif filter_type == 4:
+            for i in range(stride):
+                left = recon[i - bpp] if i >= bpp else 0
+                up = prev[i]
+                up_left = prev[i - bpp] if i >= bpp else 0
+                p = left + up - up_left
+                pa = abs(p - left)
+                pb = abs(p - up)
+                pc = abs(p - up_left)
+                pr = left if pa <= pb and pa <= pc else (up if pb <= pc else up_left)
+                recon[i] = (scan[i] + pr) & 0xFF
+        else:
+            return None
+
+        out[row * stride : (row + 1) * stride] = recon
+        prev = recon
+
+    rgb_rows = bytearray()
+    alpha_rows = bytearray()
+    for row in range(height):
+        rgb_rows.append(0)
+        alpha_rows.append(0)
+        row_data = out[row * stride : (row + 1) * stride]
+        for px in range(0, len(row_data), 4):
+            rgb_rows.extend(row_data[px : px + 3])
+            alpha_rows.append(row_data[px + 3])
+
+    return {
+        "width": width,
+        "height": height,
+        "rgb_compressed": zlib.compress(bytes(rgb_rows), level=9),
+        "alpha_compressed": zlib.compress(bytes(alpha_rows), level=9),
+    }
+
+
+def _markdown_to_pdf_bytes(markdown: str, watermark: str = WATERMARK_TEXT) -> bytes:
+    plain = _strip_markdown(markdown)
+    lines = []
+    for line in plain.splitlines():
+        if len(line) <= 105:
+            lines.append(line)
+            continue
+        words = line.split()
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if len(candidate) > 105:
+                if current:
+                    lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+
+    lines_per_page = 45
+    pages = [lines[i : i + lines_per_page] for i in range(0, len(lines), lines_per_page)] or [[]]
+    objects: dict[int, bytes] = {}
+    pages_object_index = 2
+    font_object_index = 3
+    logo_obj_index = 4
+    logo_alpha_obj_index = 5
+    page_object_indices = []
+    content_object_indices = []
+    first_dynamic_obj_index = 6
+
+    logo = _decode_png_rgba_for_pdf(PDF_LOGO_PATH)
+
+    for idx, page_lines in enumerate(pages):
+        page_obj = first_dynamic_obj_index + idx * 2
+        content_obj = page_obj + 1
+        page_object_indices.append(page_obj)
+        content_object_indices.append(content_obj)
+
+        stream_lines = []
+        # Header: centered logo + brand text, with centered subtitle.
+        brand_size = 12
+        logo_size = 34
+        logo_gap = 0
+        brand_x = _pdf_centered_x(watermark, brand_size)
+        group_left = max(50.0, brand_x - (logo_size + logo_gap))
+        brand_x = group_left + logo_size + logo_gap
+        stream_lines.append(f"BT /F1 {brand_size} Tf 0.18 g {brand_x:.2f} 768 Td")
+        stream_lines.append(f"({_pdf_escape(watermark)}) Tj ET")
+
+        header_subtitle = "Product Requirements Document"
+        subtitle_x = _pdf_centered_x(header_subtitle, 11)
+        stream_lines.append(f"BT /F1 11 Tf 0.32 g {subtitle_x:.2f} 752 Td")
+        stream_lines.append(f"({_pdf_escape(header_subtitle)}) Tj ET")
+        stream_lines.append("0.85 g 50 748 m 562 748 l S")
+
+        # Footer: left brand and right page number.
+        footer_logo_size = 14
+        footer_logo_x = 50
+        footer_logo_y = 16
+        footer_text_x = footer_logo_x + footer_logo_size
+        footer_text_y = 20
+        page_label = f"Page {idx + 1}"
+        page_x = _pdf_right_aligned_x(page_label, 8, 562.0)
+        stream_lines.append("0.85 g 50 34 m 562 34 l S")
+        stream_lines.append(f"BT /F1 8 Tf 0.45 g {page_x:.2f} 20 Td")
+        stream_lines.append(f"({_pdf_escape(page_label)}) Tj ET")
+
+        # Logo only in header and footer.
+        if logo:
+            stream_lines.append("q")
+            stream_lines.append(f"{logo_size} 0 0 {logo_size} {group_left:.2f} 754 cm")
+            stream_lines.append("/ImLogo Do")
+            stream_lines.append("Q")
+            stream_lines.append("q")
+            stream_lines.append(f"{footer_logo_size} 0 0 {footer_logo_size} {footer_logo_x} {footer_logo_y} cm")
+            stream_lines.append("/ImLogo Do")
+            stream_lines.append("Q")
+        stream_lines.append(f"BT /F1 8 Tf 0.45 g {footer_text_x} {footer_text_y} Td")
+        stream_lines.append(f"({_pdf_escape(watermark)}) Tj ET")
+        # Body text block.
+        stream_lines.append("BT /F1 11 Tf 0 g 50 730 Td 14 TL")
+        for line in page_lines:
+            stream_lines.append(f"({_pdf_escape(line)}) Tj T*")
+        stream_lines.append("ET")
+        stream = "\n".join(stream_lines).encode("latin-1", errors="replace")
+        objects[content_obj] = (
+            f"{content_obj} 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode("latin-1")
+            + stream
+            + b"\nendstream\nendobj\n"
+        )
+
+        xobject = f"/XObject << /ImLogo {logo_obj_index} 0 R >> " if logo else ""
+        objects[page_obj] = (
+            (
+                f"{page_obj} 0 obj\n"
+                f"<< /Type /Page /Parent {pages_object_index} 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 {font_object_index} 0 R >> {xobject}>> "
+                f"/Contents {content_obj} 0 R >>\n"
+                "endobj\n"
+            ).encode("latin-1")
+        )
+
+    kids = " ".join([f"{pid} 0 R" for pid in page_object_indices])
+    objects.update({
+        1: b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        2: f"2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {len(page_object_indices)} >>\nendobj\n".encode("latin-1"),
+        3: b"3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    })
+    if logo:
+        objects[logo_alpha_obj_index] = (
+            f"{logo_alpha_obj_index} 0 obj\n"
+            f"<< /Type /XObject /Subtype /Image /Width {logo['width']} /Height {logo['height']} "
+            "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
+            f"/DecodeParms << /Predictor 15 /Colors 1 /BitsPerComponent 8 /Columns {logo['width']} >> "
+            f"/Length {len(logo['alpha_compressed'])} >>\nstream\n".encode("latin-1")
+            + logo["alpha_compressed"]
+            + b"\nendstream\nendobj\n"
+        )
+        objects[logo_obj_index] = (
+            f"{logo_obj_index} 0 obj\n"
+            f"<< /Type /XObject /Subtype /Image /Width {logo['width']} /Height {logo['height']} "
+            "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode "
+            f"/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns {logo['width']} >> "
+            f"/SMask {logo_alpha_obj_index} 0 R "
+            f"/Length {len(logo['rgb_compressed'])} >>\nstream\n".encode("latin-1")
+            + logo["rgb_compressed"]
+            + b"\nendstream\nendobj\n"
+        )
+
+    max_obj = max(objects.keys())
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0] * (max_obj + 1)
+
+    for obj_id in range(1, max_obj + 1):
+        offsets[obj_id] = len(pdf)
+        pdf += objects[obj_id]
+
+    xref_pos = len(pdf)
+    pdf += f"xref\n0 {max_obj + 1}\n".encode("latin-1")
+    pdf += b"0000000000 65535 f \n"
+    for obj_id in range(1, max_obj + 1):
+        pdf += f"{offsets[obj_id]:010d} 00000 n \n".encode("latin-1")
+    pdf += (
+        f"trailer\n<< /Size {max_obj + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF".encode("latin-1")
+    )
+    return bytes(pdf)
+
+
+def _markdown_to_doc_bytes(markdown: str, watermark: str = WATERMARK_TEXT) -> bytes:
+    plain = _strip_markdown(markdown)
+
+    def esc(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+    body_lines = plain.splitlines() or ["Insufficient information provided."]
+    body = "\\par\n".join([esc(line) for line in body_lines])
+    rtf = (
+        "{\\rtf1\\ansi\\deff0"
+        "{\\fonttbl{\\f0 Arial;}}"
+        "{\\header \\pard\\qr\\fs18 "
+        + esc(watermark)
+        + " - Product Requirements Document\\par}"
+        "{\\footer \\pard\\ql\\fs18 "
+        + esc(watermark)
+        + "\\tab\\tab\\qr Page {\\field{\\*\\fldinst PAGE }}\\par}"
+        "\\paperw12240\\paperh15840\\margl1440\\margr1440\\margt1440\\margb1440"
+        "\\pard\\qc\\fs56\\cf1 "
+        + esc(watermark)
+        + "\\par\\pard\\fs22\\ql "
+        + body
+        + "\\par}"
+    )
+    return rtf.encode("utf-8", errors="replace")
 
 
 def _utcnow() -> datetime:
@@ -184,6 +486,67 @@ def _apply_clarification_answers(
     )
 
 
+async def _store_clarification_answers(
+    *,
+    tenant_id: str,
+    project_id: str,
+    user_id: str,
+    draft: PRDGenerateRequest,
+    answers: dict[str, str | list[str]],
+    merged: PRDGenerateRequest,
+) -> None:
+    db = get_db()
+    now = _utcnow()
+    await db.prd_clarifications.update_one(
+        {
+            "tenant_id": _as_oid(tenant_id, "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+            "user_id": user_id,
+        },
+        {
+            "$set": {
+                "draft": draft.model_dump(),
+                "answers": answers,
+                "merged_payload": merged.model_dump(),
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+
+async def _merge_payload_with_saved_clarification(
+    *,
+    tenant_id: str,
+    project_id: str,
+    user_id: str,
+    payload: PRDGenerateRequest,
+) -> PRDGenerateRequest:
+    db = get_db()
+    saved = await db.prd_clarifications.find_one(
+        {
+            "tenant_id": _as_oid(tenant_id, "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+            "user_id": user_id,
+        }
+    )
+    if not saved:
+        return payload
+
+    merged_payload = saved.get("merged_payload")
+    if isinstance(merged_payload, dict):
+        try:
+            return PRDGenerateRequest.model_validate(merged_payload)
+        except Exception:
+            pass
+
+    saved_answers = saved.get("answers")
+    if isinstance(saved_answers, dict):
+        return _apply_clarification_answers(payload, saved_answers)
+    return payload
+
+
 async def _append_run_event(run_id: ObjectId, event: dict) -> None:
     db = get_db()
     now = _utcnow()
@@ -228,6 +591,7 @@ async def _append_run_event(run_id: ObjectId, event: dict) -> None:
                     "steps.$.output_tokens": event.get("output_tokens"),
                     "steps.$.retry_count": event.get("retry_count", 0),
                     "steps.$.error": event.get("error"),
+                    "steps.$.stage_output": event.get("stage_output"),
                 },
                 "$push": {"events": {"at": now, **event}},
             },
@@ -238,6 +602,17 @@ async def _append_run_event(run_id: ObjectId, event: dict) -> None:
         {"_id": run_id},
         {"$set": {"updated_at": now}, "$push": {"events": {"at": now, **event}}},
     )
+
+
+async def _get_run_controls(run_id: ObjectId) -> dict[str, bool]:
+    db = get_db()
+    doc = await db.prd_runs.find_one({"_id": run_id}, {"pause_requested": 1, "stop_requested": 1})
+    if not doc:
+        return {"pause": False, "stop": True}
+    return {
+        "pause": bool(doc.get("pause_requested")),
+        "stop": bool(doc.get("stop_requested")),
+    }
 
 
 async def _run_prd_job(
@@ -253,6 +628,7 @@ async def _run_prd_job(
             payload,
             tenant_id=tenant_id,
             progress_cb=lambda ev: _append_run_event(run_id, ev),
+            control_cb=lambda: _get_run_controls(run_id),
         )
         stored = await store_prd_version(
             project_id=project_id,
@@ -279,6 +655,32 @@ async def _run_prd_job(
                 }
             },
         )
+    except RuntimeError as exc:
+        # User-initiated stop path.
+        await db.prd_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "stopped",
+                    "updated_at": _utcnow(),
+                    "completed_at": _utcnow(),
+                    "error": str(exc),
+                }
+            },
+        )
+    except asyncio.CancelledError:
+        # Cancellation from /stop endpoint should persist as stopped.
+        await db.prd_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "stopped",
+                    "updated_at": _utcnow(),
+                    "completed_at": _utcnow(),
+                    "error": "Run stopped by user.",
+                }
+            },
+        )
     except Exception as exc:
         logger.exception("prd_run_failed run_id=%s project_id=%s", str(run_id), project_id)
         await db.prd_runs.update_one(
@@ -292,6 +694,8 @@ async def _run_prd_job(
                 }
             },
         )
+    finally:
+        _ACTIVE_PRD_TASKS_BY_RUN_ID.pop(str(run_id), None)
 
 
 async def _enqueue_prd_run(
@@ -315,13 +719,15 @@ async def _enqueue_prd_run(
         "events": [{"at": now, "status": "queued"}],
         "error": None,
         "result": None,
+        "pause_requested": False,
+        "stop_requested": False,
         "created_at": now,
         "updated_at": now,
         "started_at": None,
         "completed_at": None,
     }
     await db.prd_runs.insert_one(run_doc)
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_prd_job(
             run_id=run_id,
             payload=payload,
@@ -330,6 +736,9 @@ async def _enqueue_prd_run(
             created_by=created_by,
         )
     )
+    _ACTIVE_PRD_TASKS.add(task)
+    _ACTIVE_PRD_TASKS_BY_RUN_ID[str(run_id)] = task
+    task.add_done_callback(lambda t: _ACTIVE_PRD_TASKS.discard(t))
     return {"run_id": str(run_id), "status": "queued"}
 
 
@@ -341,6 +750,12 @@ async def generate_prd(
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    payload = await _merge_payload_with_saved_clarification(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        user_id=user.get("user_id"),
+        payload=payload,
+    )
 
     clarification = _build_clarification(payload)
     if clarification and clarification.questions:
@@ -383,6 +798,12 @@ async def generate_prd_multistep(
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    payload = await _merge_payload_with_saved_clarification(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        user_id=user.get("user_id"),
+        payload=payload,
+    )
     try:
         result = await generate_multistep_prd(payload, tenant_id=user.get("tenant_id"))
     except ValueError as exc:
@@ -416,6 +837,12 @@ async def generate_prd_multistep_run(
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    payload = await _merge_payload_with_saved_clarification(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        user_id=user.get("user_id"),
+        payload=payload,
+    )
     clarification = _build_clarification(payload)
     if clarification and clarification.questions:
         logger.warning(
@@ -457,6 +884,38 @@ async def get_prd_run_status(
         raise HTTPException(status_code=404, detail="Run not found")
 
     now = _utcnow()
+    run_status = doc.get("status")
+    updated_at = _as_aware_dt(doc.get("updated_at")) or _as_aware_dt(doc.get("created_at")) or now
+
+    # Heal orphaned runs that are stuck in queued/running due worker interruption.
+    stale_seconds = (now - updated_at).total_seconds()
+    if run_status in {"queued", "running"} and stale_seconds > max(RUN_STALE_TIMEOUT_SECONDS, settings.prd_generation_timeout_seconds):
+        fail_error = "Run timed out or background worker stopped before completion."
+        await db.prd_runs.update_one(
+            {"_id": doc["_id"]},
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": fail_error,
+                    "updated_at": now,
+                    "completed_at": now,
+                }
+            },
+        )
+        await db.prd_runs.update_many(
+            {"_id": doc["_id"], "steps.status": "running"},
+            {
+                "$set": {
+                    "steps.$[s].status": "failed",
+                    "steps.$[s].ended_at": now,
+                    "steps.$[s].error": fail_error,
+                }
+            },
+            array_filters=[{"s.status": "running"}],
+        )
+        doc = await db.prd_runs.find_one({"_id": doc["_id"]})
+        run_status = doc.get("status")
+
     steps = doc.get("steps", [])
     step_timings: list[dict] = []
     for step in steps:
@@ -484,7 +943,7 @@ async def get_prd_run_status(
 
     return {
         "run_id": str(doc["_id"]),
-        "status": doc.get("status"),
+        "status": run_status,
         "steps": step_timings,
         "error": doc.get("error"),
         "result": doc.get("result"),
@@ -498,6 +957,118 @@ async def get_prd_run_status(
     }
 
 
+@router.post("/runs/{run_id}/pause")
+async def pause_prd_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.prd_runs.find_one(
+        {
+            "_id": oid,
+            "tenant_id": _as_oid(user.get("tenant_id"), "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.prd_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": True, "status": "paused", "updated_at": _utcnow()}},
+    )
+    await _append_run_event(oid, {"stage": "run", "status": "paused"})
+    return {"run_id": run_id, "status": "paused"}
+
+
+@router.post("/runs/{run_id}/resume")
+async def resume_prd_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.prd_runs.find_one(
+        {
+            "_id": oid,
+            "tenant_id": _as_oid(user.get("tenant_id"), "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.prd_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": False, "status": "running", "updated_at": _utcnow()}},
+    )
+    await _append_run_event(oid, {"stage": "run", "status": "running"})
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.post("/runs/{run_id}/stop")
+async def stop_prd_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.prd_runs.find_one(
+        {
+            "_id": oid,
+            "tenant_id": _as_oid(user.get("tenant_id"), "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+
+    now = _utcnow()
+    await db.prd_runs.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "stop_requested": True,
+                "pause_requested": False,
+                "status": "stopped",
+                "error": "Run stopped by user.",
+                "updated_at": now,
+                "completed_at": now,
+            }
+        },
+    )
+    await db.prd_runs.update_many(
+        {"_id": oid, "steps.status": "running"},
+        {
+            "$set": {
+                "steps.$[s].status": "failed",
+                "steps.$[s].ended_at": now,
+                "steps.$[s].error": "Run stopped by user.",
+            }
+        },
+        array_filters=[{"s.status": "running"}],
+    )
+    task = _ACTIVE_PRD_TASKS_BY_RUN_ID.get(run_id)
+    if task and not task.done():
+        task.cancel()
+    await _append_run_event(oid, {"stage": "run", "status": "stopped", "error": "Run stopped by user."})
+    return {"run_id": run_id, "status": "stopped"}
+
+
 @router.post("/clarification/respond")
 async def respond_prd_clarification(
     payload: PRDClarificationRespondRequest,
@@ -507,6 +1078,14 @@ async def respond_prd_clarification(
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
     merged = _apply_clarification_answers(payload.draft, payload.answers)
+    await _store_clarification_answers(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        user_id=user.get("user_id"),
+        draft=payload.draft,
+        answers=payload.answers,
+        merged=merged,
+    )
     clarification = _build_clarification(merged)
     if clarification and clarification.questions:
         return {
@@ -520,6 +1099,30 @@ async def respond_prd_clarification(
         tenant_id=user.get("tenant_id"),
         created_by=user.get("user_id"),
     )
+
+
+@router.get("/clarification/latest")
+async def get_latest_prd_clarification(
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    db = get_db()
+    doc = await db.prd_clarifications.find_one(
+        {
+            "tenant_id": _as_oid(user.get("tenant_id"), "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+            "user_id": user.get("user_id"),
+        }
+    )
+    if not doc:
+        return {"answers": {}, "merged_payload": None, "updated_at": None}
+    return {
+        "answers": doc.get("answers") or {},
+        "merged_payload": doc.get("merged_payload"),
+        "updated_at": doc.get("updated_at"),
+    }
 
 
 @router.post("/generate/stream")
@@ -623,6 +1226,60 @@ async def get_latest_prd(
         "content": latest["markdown_content"],
         "source": "llm",
     }
+
+
+@router.get("/export")
+async def export_prd(
+    project_id: str | None = None,
+    type: Literal["md", "pdf", "doc"] = "md",
+    version: int | None = None,
+    doc_type: Literal["prd", "sdd"] = "prd",
+    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+
+    if doc_type == "sdd":
+        db = get_db()
+        tenant_oid = _as_oid(_user.get("tenant_id"), "tenant_id")
+        project_oid = _as_oid(project_id, "project_id")
+        query: dict = {"tenant_id": tenant_oid, "project_id": project_oid}
+        if version is not None:
+            query["version"] = version
+            doc = await db.system_design_documents.find_one(query, sort=[("generated_at", -1)])
+        else:
+            doc = await db.system_design_documents.find_one(query, sort=[("version", -1)])
+        if not doc:
+            raise HTTPException(status_code=404, detail="SDD not found")
+        markdown = doc.get("content", "")
+        version_number = doc.get("version", "latest")
+        base_name = f"decisionvault-sdd-v{version_number}"
+    else:
+        doc = await get_prd_version(project_id, version) if version else await get_latest_prd_version(project_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="PRD not found")
+        markdown = doc.get("markdown_content", "")
+        version_number = doc.get("version_number", "latest")
+        base_name = f"decisionvault-prd-v{version_number}"
+
+    if type == "md":
+        content = markdown.encode("utf-8")
+        media_type = "text/markdown; charset=utf-8"
+        filename = f"{base_name}.md"
+    elif type == "pdf":
+        content = _markdown_to_pdf_bytes(markdown)
+        media_type = "application/pdf"
+        filename = f"{base_name}.pdf"
+    else:
+        content = _markdown_to_doc_bytes(markdown)
+        media_type = "application/msword"
+        filename = f"{base_name}.doc"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/versions")

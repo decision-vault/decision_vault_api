@@ -45,3 +45,38 @@ class MessageOut(BaseModel):
     created_by: str
     created_by_name: str
     created_at: datetime
+
+
+class PersonalChatCreate(BaseModel):
+    participant_user_id: str = Field(..., min_length=24, max_length=24)
+
+
+class PersonalMessageCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
+class PersonalContactOut(BaseModel):
+    user_id: str
+    display_name: str
+    email: str
+
+
+class PersonalChatOut(BaseModel):
+    id: str
+    participant_user_id: str
+    participant_display_name: str
+    participant_email: str
+    created_at: datetime
+    updated_at: datetime
+    last_message_preview: str | None = None
+    last_message_at: datetime | None = None
+    message_count: int = 0
+
+
+class PersonalMessageOut(BaseModel):
+    id: str
+    chat_id: str
+    content: str
+    created_by: str
+    created_by_name: str
+    created_at: datetime

@@ -59,6 +59,30 @@ def _serialize_message(doc: dict) -> dict:
     }
 
 
+def _serialize_personal_message(doc: dict) -> dict:
+    return {
+        "id": str(doc["_id"]),
+        "chat_id": str(doc["chat_id"]),
+        "content": doc["content"],
+        "created_by": str(doc["created_by"]),
+        "created_by_name": doc.get("created_by_name") or "Unknown",
+        "created_at": doc["created_at"],
+    }
+
+
+def _serialize_personal_contact(doc: dict) -> dict:
+    return {
+        "user_id": str(doc["_id"]),
+        "display_name": doc.get("name") or doc.get("email") or "Unknown",
+        "email": doc.get("email") or "",
+    }
+
+
+def _personal_chat_key(user_a_id: str, user_b_id: str) -> str:
+    user_ids = sorted([user_a_id, user_b_id])
+    return f"{user_ids[0]}:{user_ids[1]}"
+
+
 async def _resolve_user_name(user_id: str) -> str:
     db = get_db()
     user = await db.users.find_one({"_id": _oid(user_id)}, {"name": 1, "email": 1})
@@ -376,3 +400,262 @@ async def set_channel_favorite(
     else:
         await db.project_channel_favorites.delete_one(query)
     return True
+
+
+async def _is_project_member(tenant_id: str, project_id: str, user_id: str) -> bool:
+    db = get_db()
+    try:
+        user_oid = _oid(user_id)
+    except Exception:
+        return False
+    member = await db.project_members.find_one(
+        {
+            "tenant_id": _oid(tenant_id),
+            "project_id": _oid(project_id),
+            "user_id": user_oid,
+            "deleted_at": None,
+        },
+        {"_id": 1},
+    )
+    return bool(member)
+
+
+async def list_personal_contacts(tenant_id: str, project_id: str, user_id: str) -> list[dict]:
+    db = get_db()
+    members = await db.project_members.find(
+        {
+            "tenant_id": _oid(tenant_id),
+            "project_id": _oid(project_id),
+            "deleted_at": None,
+            "user_id": {"$ne": _oid(user_id)},
+        },
+        {"user_id": 1},
+    ).to_list(length=500)
+    user_ids = [item.get("user_id") for item in members if item.get("user_id")]
+    if not user_ids:
+        return []
+    users = await db.users.find({"_id": {"$in": user_ids}}, {"name": 1, "email": 1}).to_list(length=500)
+    contacts = [_serialize_personal_contact(doc) for doc in users]
+    contacts.sort(key=lambda item: (item["display_name"] or "").lower())
+    return contacts
+
+
+async def list_personal_chats(tenant_id: str, project_id: str, user_id: str) -> list[dict]:
+    db = get_db()
+    user_oid = _oid(user_id)
+    chats = await db.project_personal_chats.find(
+        {
+            "tenant_id": _oid(tenant_id),
+            "project_id": _oid(project_id),
+            "participant_ids": user_oid,
+            "deleted_at": None,
+        }
+    ).sort("updated_at", -1).to_list(length=300)
+    if not chats:
+        return []
+
+    chat_ids = [doc["_id"] for doc in chats]
+    message_counts = {
+        item["_id"]: item["count"]
+        async for item in db.project_personal_messages.aggregate(
+            [
+                {
+                    "$match": {
+                        "tenant_id": _oid(tenant_id),
+                        "project_id": _oid(project_id),
+                        "chat_id": {"$in": chat_ids},
+                    }
+                },
+                {"$group": {"_id": "$chat_id", "count": {"$sum": 1}}},
+            ]
+        )
+    }
+    last_messages = {
+        item["_id"]: item
+        async for item in db.project_personal_messages.aggregate(
+            [
+                {
+                    "$match": {
+                        "tenant_id": _oid(tenant_id),
+                        "project_id": _oid(project_id),
+                        "chat_id": {"$in": chat_ids},
+                    }
+                },
+                {"$sort": {"chat_id": 1, "created_at": -1}},
+                {
+                    "$group": {
+                        "_id": "$chat_id",
+                        "content": {"$first": "$content"},
+                        "created_at": {"$first": "$created_at"},
+                    }
+                },
+            ]
+        )
+    }
+
+    other_user_ids = set()
+    for chat in chats:
+        for participant_id in chat.get("participant_ids") or []:
+            if participant_id != user_oid:
+                other_user_ids.add(participant_id)
+    users = await db.users.find({"_id": {"$in": list(other_user_ids)}}, {"name": 1, "email": 1}).to_list(length=500)
+    user_map = {doc["_id"]: doc for doc in users}
+
+    payload = []
+    for chat in chats:
+        participant_ids = chat.get("participant_ids") or []
+        other_user_id = next((pid for pid in participant_ids if pid != user_oid), None)
+        profile = user_map.get(other_user_id, {})
+        last_message = last_messages.get(chat["_id"])
+        preview = None
+        if last_message and last_message.get("content"):
+            preview = str(last_message["content"])[:120]
+        payload.append(
+            {
+                "id": str(chat["_id"]),
+                "participant_user_id": str(other_user_id) if other_user_id else "",
+                "participant_display_name": profile.get("name") or profile.get("email") or "Unknown",
+                "participant_email": profile.get("email") or "",
+                "created_at": chat["created_at"],
+                "updated_at": chat.get("updated_at") or chat["created_at"],
+                "last_message_preview": preview,
+                "last_message_at": last_message.get("created_at") if last_message else None,
+                "message_count": message_counts.get(chat["_id"], 0),
+            }
+        )
+    return payload
+
+
+async def create_personal_chat(
+    tenant_id: str,
+    project_id: str,
+    user_id: str,
+    participant_user_id: str,
+) -> dict:
+    if participant_user_id == user_id:
+        raise ValueError("Cannot create a personal chat with yourself")
+    db = get_db()
+    if not await _is_project_member(tenant_id, project_id, participant_user_id):
+        raise ValueError("Participant is not a project member")
+
+    participant_key = _personal_chat_key(user_id, participant_user_id)
+    existing = await db.project_personal_chats.find_one(
+        {
+            "tenant_id": _oid(tenant_id),
+            "project_id": _oid(project_id),
+            "participant_key": participant_key,
+            "deleted_at": None,
+        }
+    )
+    if existing:
+        chats = await list_personal_chats(tenant_id, project_id, user_id)
+        for chat in chats:
+            if chat["id"] == str(existing["_id"]):
+                return chat
+
+    now = _utcnow()
+    doc = {
+        "tenant_id": _oid(tenant_id),
+        "project_id": _oid(project_id),
+        "participant_ids": [_oid(user_id), _oid(participant_user_id)],
+        "participant_key": participant_key,
+        "created_by": _oid(user_id),
+        "created_at": now,
+        "updated_at": now,
+        "deleted_at": None,
+    }
+    result = await db.project_personal_chats.insert_one(doc)
+    user = await db.users.find_one({"_id": _oid(participant_user_id)}, {"name": 1, "email": 1})
+    return {
+        "id": str(result.inserted_id),
+        "participant_user_id": participant_user_id,
+        "participant_display_name": user.get("name") if user else "Unknown",
+        "participant_email": user.get("email") if user else "",
+        "created_at": now,
+        "updated_at": now,
+        "last_message_preview": None,
+        "last_message_at": None,
+        "message_count": 0,
+    }
+
+
+async def list_personal_messages(
+    tenant_id: str,
+    project_id: str,
+    chat_id: str,
+    user_id: str,
+    limit: int = 200,
+) -> list[dict]:
+    db = get_db()
+    try:
+        chat_oid = _oid(chat_id)
+        user_oid = _oid(user_id)
+    except Exception as exc:
+        raise ValueError("Personal chat not found") from exc
+    chat = await db.project_personal_chats.find_one(
+        {
+            "_id": chat_oid,
+            "tenant_id": _oid(tenant_id),
+            "project_id": _oid(project_id),
+            "participant_ids": user_oid,
+            "deleted_at": None,
+        },
+        {"_id": 1},
+    )
+    if not chat:
+        raise ValueError("Personal chat not found")
+
+    cursor = db.project_personal_messages.find(
+        {
+            "tenant_id": _oid(tenant_id),
+            "project_id": _oid(project_id),
+            "chat_id": chat_oid,
+        }
+    ).sort("created_at", 1).limit(max(1, min(limit, 500)))
+    return [_serialize_personal_message(doc) async for doc in cursor]
+
+
+async def create_personal_message(
+    tenant_id: str,
+    project_id: str,
+    chat_id: str,
+    user_id: str,
+    content: str,
+) -> dict:
+    db = get_db()
+    try:
+        chat_oid = _oid(chat_id)
+        user_oid = _oid(user_id)
+    except Exception as exc:
+        raise ValueError("Personal chat not found") from exc
+    chat = await db.project_personal_chats.find_one(
+        {
+            "_id": chat_oid,
+            "tenant_id": _oid(tenant_id),
+            "project_id": _oid(project_id),
+            "participant_ids": user_oid,
+            "deleted_at": None,
+        }
+    )
+    if not chat:
+        raise ValueError("Personal chat not found")
+
+    user_name = await _resolve_user_name(user_id)
+    now = _utcnow()
+    doc = {
+        "tenant_id": _oid(tenant_id),
+        "project_id": _oid(project_id),
+        "chat_id": chat_oid,
+        "content": content.strip(),
+        "created_by": user_oid,
+        "created_by_name": user_name,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = await db.project_personal_messages.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    await db.project_personal_chats.update_one(
+        {"_id": chat_oid},
+        {"$set": {"updated_at": now}},
+    )
+    return _serialize_personal_message(doc)

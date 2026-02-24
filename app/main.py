@@ -131,6 +131,8 @@ async def startup() -> None:
     await db.prd_documents.create_index([("intake_id", 1), ("version", 1)], unique=True)
     await db.prd_runs.create_index([("tenant_id", 1), ("project_id", 1), ("created_at", -1)])
     await db.prd_runs.create_index([("project_id", 1), ("status", 1), ("updated_at", -1)])
+    await db.prd_clarifications.create_index([("tenant_id", 1), ("project_id", 1), ("user_id", 1)], unique=True)
+    await db.prd_clarifications.create_index([("project_id", 1), ("updated_at", -1)])
     if settings.enable_rate_limiter:
         try:
             redis_client = redis.from_url(settings.redis_url)
@@ -153,6 +155,16 @@ async def startup() -> None:
     await db.project_channel_favorites.create_index(
         [("tenant_id", 1), ("project_id", 1), ("channel_id", 1), ("user_id", 1)],
         unique=True,
+    )
+    await db.project_personal_chats.create_index(
+        [("tenant_id", 1), ("project_id", 1), ("participant_key", 1)],
+        unique=True,
+    )
+    await db.project_personal_chats.create_index(
+        [("tenant_id", 1), ("project_id", 1), ("participant_ids", 1), ("updated_at", -1)]
+    )
+    await db.project_personal_messages.create_index(
+        [("tenant_id", 1), ("project_id", 1), ("chat_id", 1), ("created_at", 1)]
     )
     try:
         await ensure_prd_table()

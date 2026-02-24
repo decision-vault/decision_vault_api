@@ -6,15 +6,25 @@ from app.schemas.messenger import (
     ChannelOut,
     MessageCreate,
     MessageOut,
+    PersonalChatCreate,
+    PersonalChatOut,
+    PersonalContactOut,
+    PersonalMessageCreate,
+    PersonalMessageOut,
     ThreadCreate,
     ThreadOut,
 )
 from app.services.messenger_service import (
     create_channel,
     create_message,
+    create_personal_chat,
+    create_personal_message,
     create_thread,
     list_channels,
     list_messages,
+    list_personal_chats,
+    list_personal_contacts,
+    list_personal_messages,
     list_threads,
     set_channel_favorite,
 )
@@ -152,3 +162,87 @@ async def unfavorite_channel_route(
     if not ok:
         raise HTTPException(status_code=404, detail="Channel not found")
     return {"status": "unfavorited"}
+
+
+@router.get("/personal/contacts", response_model=list[PersonalContactOut])
+async def list_personal_contacts_route(
+    project_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", projectRole="viewer")),
+):
+    return await list_personal_contacts(
+        request.state.tenant_id,
+        project_id,
+        user.get("user_id"),
+    )
+
+
+@router.get("/personal/chats", response_model=list[PersonalChatOut])
+async def list_personal_chats_route(
+    project_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", projectRole="viewer")),
+):
+    return await list_personal_chats(
+        request.state.tenant_id,
+        project_id,
+        user.get("user_id"),
+    )
+
+
+@router.post("/personal/chats", response_model=PersonalChatOut)
+async def create_personal_chat_route(
+    project_id: str,
+    payload: PersonalChatCreate,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", projectRole="member")),
+):
+    try:
+        return await create_personal_chat(
+            request.state.tenant_id,
+            project_id,
+            user.get("user_id"),
+            payload.participant_user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/personal/chats/{chat_id}/messages", response_model=list[PersonalMessageOut])
+async def list_personal_messages_route(
+    project_id: str,
+    chat_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    user=Depends(withGuard(feature="view_decision", projectRole="viewer")),
+):
+    try:
+        return await list_personal_messages(
+            request.state.tenant_id,
+            project_id,
+            chat_id,
+            user.get("user_id"),
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/personal/chats/{chat_id}/messages", response_model=PersonalMessageOut)
+async def create_personal_message_route(
+    project_id: str,
+    chat_id: str,
+    payload: PersonalMessageCreate,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", projectRole="member")),
+):
+    try:
+        return await create_personal_message(
+            request.state.tenant_id,
+            project_id,
+            chat_id,
+            user.get("user_id"),
+            payload.content,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))

@@ -1,0 +1,7 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Explicit path requested
+app/__pycache__/
+app/api/__pycache__/

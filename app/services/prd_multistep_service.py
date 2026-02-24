@@ -1,61 +1,50 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
-import ast
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Type
+from collections import Counter
+from typing import Any, Awaitable, Callable, get_origin
 
-import httpx
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.core.config import settings
 from app.schemas.prd_generation import PRDGenerateRequest, PRDMultiStepResponse
 from app.services.llm_usage_service import log_llm_usage
 from app.services.token_limiter import TokenBudget, TokenLimiter
 
-
 logger = logging.getLogger("decisionvault.prd.multistep")
 
-STRICT_PROMPT = (
-    "Only use provided information. Do not invent statistics, integrations, or technologies. "
-    "If data is missing, write 'Insufficient information provided'. "
-    "Write concrete, professional content and avoid placeholder wording. "
-    "Never output JSON fragments, key names, braces, or escaped markdown."
-)
-
-DETAIL_PROMPT = (
-    "Expand depth and clarity while preserving meaning. "
-    "Do not introduce new facts not present in input. "
-    "Prefer implementation-ready wording."
+SYSTEM_CONTENT_ONLY = (
+    "You are generating CONTENT ONLY for a predefined PRD schema. "
+    "Do not output section numbers, markdown headers, JSON wrappers, or code fences. "
+    "Do not invent sections, integrations, features, statistics, percentages, currency, or technologies not present in input. "
+    "Do not change structure. Fill only requested fields. "
+    "If input is insufficient for a field, output exactly: 'Insufficient information provided.'"
 )
 
 DOC_STYLE_GUIDE = (
-    "Output must be professional PRD-quality Markdown-ready prose, never JSON-like prose. "
-    "Each section value must be clean plain text suitable for direct insertion into Markdown. "
-    "No braces, no quoted key/value output, no code fences, no escaped newlines (\\\\n), and no LaTeX commands. "
-    "Use concise subheadings, dense but readable bullets, and measurable language when present in input. "
-    "Use plain Markdown tables only when requested."
+    "Return strict JSON that matches the requested schema exactly. "
+    "Each field value must be markdown-ready prose (paragraphs and bullet content), or a list of strings. "
+    "Do not include markdown headings because the renderer owns headings and numbering. "
+    "Do not include escaped newline literals (\\\\n), key commentary, examples, or additional keys."
 )
 
-KNOWN_INTEGRATIONS = {
-    "slack",
-    "jira",
-    "trello",
-    "salesforce",
-    "stripe",
-    "razorpay",
-    "github",
-    "notion",
-    "google drive",
-    "figma",
-}
+DETAIL_DEPTH_GUIDE = (
+    "Write detailed, concrete content suitable for enterprise PRD review. "
+    "For narrative fields, provide 2-4 substantive paragraphs. "
+    "For list fields, provide 5-10 specific items when input supports it. "
+    "Prefer explicit constraints, measurable outcomes, and implementation-ready wording."
+)
 
-MAX_STAGE_INPUT_TOKENS = 3000
-MAX_STAGE_OUTPUT_TOKENS = 3000
+MAX_STAGE_INPUT_TOKENS = 1500
+MAX_STAGE_OUTPUT_TOKENS = 1200
+
 REQUIRED_SECTION_HEADINGS = [
     "# 1. Product Requirements Document (PRD)",
     "## 1.1 DecisionVault — Stage 1: Decision History Core",
@@ -188,13 +177,116 @@ REQUIRED_SECTION_HEADINGS = [
     "## 17. Document Change Log",
 ]
 
+EXPECTED_NUMBER_PATHS = [
+    "1.", "1.1", "2.", "3.", "3.1", "3.2", "3.3", "4.", "4.1", "4.2", "4.3", "5.", "5.1", "5.2", "5.3", "6.",
+    "6.1", "6.1.1", "6.1.2", "6.1.3", "6.1.4", "6.1.5", "6.1.6", "6.2", "7.", "7.1", "7.2", "7.3", "7.4", "8.",
+    "8.1", "8.2", "8.3", "8.4", "8.5", "9.", "9.1", "9.2", "10.", "10.1", "10.2", "10.3", "11.", "11.1", "11.2", "11.3", "11.4", "11.5",
+    "12.", "12.1", "12.2", "13.", "13.1", "13.2", "13.3", "14.", "14.1", "14.2", "14.3", "15.", "15.1", "15.2", "16.", "16.1", "16.2", "17.",
+]
 
-class TextSection(BaseModel):
+
+def _count_heading_lines(md: str, heading: str) -> int:
+    pattern = rf"(?m)^{re.escape(heading)}\s*$"
+    return len(re.findall(pattern, md))
+
+
+class SectionContent(BaseModel):
+    title: str
     content: str
 
 
-class ListSection(BaseModel):
-    items: list[str]
+class Persona(BaseModel):
+    name: str
+    role: str = "Insufficient information provided."
+    description: str
+    pain_points: list[str] = Field(default_factory=list)
+    goals: list[str] = Field(default_factory=list)
+
+
+class UserStory(BaseModel):
+    id: str
+    description: str = "Insufficient information provided."
+    acceptance_criteria: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_shape(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if not normalized.get("description") and normalized.get("title"):
+            normalized["description"] = normalized.get("title")
+        criteria = normalized.get("acceptance_criteria")
+        if isinstance(criteria, str):
+            normalized["acceptance_criteria"] = PRDOrchestrator._split_to_list(criteria)
+        return normalized
+
+
+class PRDContent(BaseModel):
+    executive_summary: str
+    core_problem: str
+    why_tools_fail: str
+    success_meaning: str
+    primary_objective: str
+    success_metrics: list[str] = Field(default_factory=list)
+    leading_indicators: list[str] = Field(default_factory=list)
+    personas: list[Persona] = Field(default_factory=list)
+    in_scope_features: list[str] = Field(default_factory=list)
+    out_of_scope: list[str] = Field(default_factory=list)
+    user_stories: list[UserStory] = Field(default_factory=list)
+    architecture_summary: str
+    data_model_summary: str
+    api_summary: str
+    slack_integration_summary: str
+    security_summary: str
+    ui_summary: str
+    dependencies_summary: str
+    non_functional_summary: str
+    testing_summary: str
+    launch_plan_summary: str
+    open_questions: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    definition_of_done: list[str] = Field(default_factory=list)
+    glossary: list[str] = Field(default_factory=list)
+
+
+class Stage1Output(BaseModel):
+    executive_summary: str
+    core_problem: str
+    why_tools_fail: str
+    success_meaning: str
+    primary_objective: str
+    success_metrics: list[str] = Field(default_factory=list)
+    leading_indicators: list[str] = Field(default_factory=list)
+    personas: list[Persona] = Field(default_factory=list)
+
+
+class Stage2Output(BaseModel):
+    in_scope_features: list[str] = Field(default_factory=list)
+    out_of_scope: list[str] = Field(default_factory=list)
+    user_stories: list[UserStory] = Field(default_factory=list)
+
+
+class Stage3Output(BaseModel):
+    architecture_summary: str
+    data_model_summary: str
+    api_summary: str
+    slack_integration_summary: str
+    security_summary: str
+
+
+class Stage4Output(BaseModel):
+    ui_summary: str
+    dependencies_summary: str
+    non_functional_summary: str
+    testing_summary: str
+    launch_plan_summary: str
+    open_questions: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    definition_of_done: list[str] = Field(default_factory=list)
+    glossary: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -210,52 +302,17 @@ class PRDOrchestrator:
         self,
         tenant_id: str,
         progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
+        control_cb: Callable[[], Awaitable[dict[str, bool]] | dict[str, bool] | None] | None = None,
     ):
         self.tenant_id = tenant_id
         self.progress_cb = progress_cb
+        self.control_cb = control_cb
         self.total_tokens_used = 0
         self.sections_generated: list[str] = []
         self.limiter = TokenLimiter(
-            TokenBudget(
-                max_input_tokens=MAX_STAGE_INPUT_TOKENS,
-                max_output_tokens=MAX_STAGE_OUTPUT_TOKENS,
-            )
+            TokenBudget(max_input_tokens=MAX_STAGE_INPUT_TOKENS, max_output_tokens=MAX_STAGE_OUTPUT_TOKENS)
         )
-
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        return max(1, int(len(text.split()) * 1.3))
-
-    @staticmethod
-    def _strip_code_fence(text: str) -> str:
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\\s*", "", cleaned)
-            cleaned = re.sub(r"\\s*```$", "", cleaned)
-        return cleaned.strip()
-
-    @classmethod
-    def _extract_json_block(cls, text: str) -> str:
-        cleaned = cls._strip_code_fence(text)
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return cleaned
-        return cleaned[start : end + 1]
-
-    @staticmethod
-    def _sanitize_generated_text(text: str) -> str:
-        s = (text or "").strip()
-        if not s:
-            return "Insufficient information provided"
-        s = s.replace("\\n", "\n").replace("\\t", " ")
-        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-        s = re.sub(r'^\{\s*"?(content|text|items)"?\s*:\s*', "", s, flags=re.IGNORECASE)
-        s = re.sub(r"\}\s*$", "", s)
-        s = s.strip().strip('"').strip("'")
-        s = re.sub(r"\s+", " ", s).strip()
-        return s or "Insufficient information provided"
+        self._pause_emitted = False
 
     async def _emit_progress(self, event: dict[str, Any]) -> None:
         if not self.progress_cb:
@@ -264,925 +321,785 @@ class PRDOrchestrator:
         if hasattr(maybe, "__await__"):
             await maybe
 
-    @classmethod
-    def _fallback_parse(cls, schema: Type[BaseModel], raw_text: str) -> BaseModel:
-        cleaned = cls._strip_code_fence(raw_text)
-        if schema is TextSection:
-            return TextSection(content=cls._sanitize_generated_text(cleaned))
-        if schema is ListSection:
-            lines = [line.strip(" -•\t") for line in cleaned.splitlines()]
-            items = [line for line in lines if line]
-            if not items:
-                items = [part.strip() for part in re.split(r"[;\n]", cleaned) if part.strip()]
-            cleaned_items = [cls._sanitize_generated_text(i) for i in items]
-            return ListSection(items=cleaned_items or ["Insufficient information provided"])
-        return schema.model_validate({})
+    async def _check_control(self, stage_name: str) -> None:
+        if not self.control_cb:
+            return
+        while True:
+            maybe = self.control_cb()
+            controls = await maybe if hasattr(maybe, "__await__") else maybe
+            controls = controls or {}
+            if controls.get("stop"):
+                await self._emit_progress({"stage": stage_name, "status": "failed", "error": "Run stopped by user."})
+                raise RuntimeError("Run stopped by user.")
+            if controls.get("pause"):
+                if not self._pause_emitted:
+                    self._pause_emitted = True
+                    await self._emit_progress({"stage": stage_name, "status": "paused"})
+                await asyncio.sleep(1.0)
+                continue
+            if self._pause_emitted:
+                self._pause_emitted = False
+                await self._emit_progress({"stage": stage_name, "status": "running"})
+            return
 
     @classmethod
-    def _parse_stage_output(cls, schema: Type[BaseModel], raw_text: str) -> BaseModel:
-        candidate = cls._extract_json_block(raw_text)
+    def _progress_payload_from_model(cls, model: BaseModel) -> dict[str, Any]:
+        raw = model.model_dump()
+
+        def shrink(value: Any) -> Any:
+            if isinstance(value, str):
+                text = value.strip()
+                return text if len(text) <= 400 else f"{text[:400]}..."
+            if isinstance(value, list):
+                return [shrink(v) for v in value[:5]]
+            if isinstance(value, dict):
+                out: dict[str, Any] = {}
+                for k, v in list(value.items())[:8]:
+                    out[k] = shrink(v)
+                return out
+            return value
+
+        return shrink(raw)
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return TokenLimiter.estimate_tokens(text)
+
+    @staticmethod
+    def _split_to_list(value: str) -> list[str]:
+        parts = [p.strip(" -\t") for p in re.split(r"[\n,;]+", value or "")]
+        return [p for p in parts if p]
+
+    @staticmethod
+    def _sanitize_text(value: str) -> str:
+        text = (value or "").strip()
+        if not text:
+            return "Insufficient information provided."
+        text = text.replace("\\n", "\n").replace("\\t", " ")
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip().strip('"').strip("'")
+        # Remove model-added markdown headers; renderer owns headers/numbering.
+        text = "\n".join([line for line in text.splitlines() if not re.match(r"^\s{0,3}#{1,6}\s+", line)])
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text).strip()
+        if text.startswith("{") and text.endswith("}"):
+            return "Insufficient information provided."
+        return text
+
+    @classmethod
+    def _coerce_schema_lists(cls, payload: dict[str, Any], schema: type[BaseModel]) -> dict[str, Any]:
+        patched = dict(payload)
+        for field_name, field in schema.model_fields.items():
+            if field_name not in patched:
+                continue
+            origin = get_origin(field.annotation)
+            if origin is list:
+                if isinstance(patched[field_name], str):
+                    patched[field_name] = cls._split_to_list(patched[field_name])
+                elif isinstance(patched[field_name], dict):
+                    patched[field_name] = [
+                        f"{str(k).strip()}: {str(v).strip()}"
+                        for k, v in patched[field_name].items()
+                        if str(k).strip() and str(v).strip()
+                    ]
+        return patched
+
+    @classmethod
+    def _sanitize_obj(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return cls._sanitize_text(value)
+        if isinstance(value, list):
+            out = [cls._sanitize_obj(v) for v in value]
+            return [v for v in out if v not in (None, "", [], {})]
+        if isinstance(value, dict):
+            return {k: cls._sanitize_obj(v) for k, v in value.items()}
+        return value
+
+    @staticmethod
+    def _extract_json_block(text: str) -> str:
+        cleaned = (text or "").strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        # Try to extract the first balanced JSON object to avoid malformed tail content.
+        start = cleaned.find("{")
+        if start >= 0:
+            depth = 0
+            in_string = False
+            escaped = False
+            for i in range(start, len(cleaned)):
+                ch = cleaned[i]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return cleaned[start : i + 1]
+
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            return cleaned[start : end + 1]
+        return cleaned
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> str:
+        candidate = (text or "").strip()
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```$", "", candidate)
+        start = candidate.find("{")
+        if start >= 0:
+            candidate = candidate[start:]
+        # Remove trailing commas before closing tokens.
+        candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+
+        # If a string is left open at the end, close it.
+        in_string = False
+        escaped = False
+        for ch in candidate:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+        if in_string:
+            if candidate.endswith("\\"):
+                candidate += " "
+            candidate += '"'
+
+        brace_diff = candidate.count("{") - candidate.count("}")
+        bracket_diff = candidate.count("[") - candidate.count("]")
+        if bracket_diff > 0:
+            candidate += "]" * bracket_diff
+        if brace_diff > 0:
+            candidate += "}" * brace_diff
+        return candidate
+
+    @classmethod
+    def _parse_structured(cls, raw: str, schema: type[BaseModel]) -> BaseModel:
+        candidate = cls._extract_json_block(raw)
+        parsed: Any
         try:
             parsed = json.loads(candidate)
-            return cls._coerce_stage_output(schema, parsed)
         except Exception:
             try:
                 parsed = ast.literal_eval(candidate)
-                return cls._coerce_stage_output(schema, parsed)
             except Exception:
-                return cls._fallback_parse(schema, raw_text)
+                repaired = cls._repair_truncated_json(candidate)
+                try:
+                    parsed = json.loads(repaired)
+                except Exception:
+                    try:
+                        parsed = ast.literal_eval(repaired)
+                    except Exception as exc:
+                        try:
+                            parsed = cls._parse_loose_by_schema(repaired, schema)
+                        except Exception:
+                            raise ValueError(f"Unable to parse JSON output: {exc}")
 
-    @staticmethod
-    def _collect_strings(value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            clean = value.strip()
-            return [clean] if clean else []
-        if isinstance(value, (int, float, bool)):
-            return [str(value)]
-        if isinstance(value, list):
-            out: list[str] = []
-            for item in value:
-                out.extend(PRDOrchestrator._collect_strings(item))
-            return out
-        if isinstance(value, dict):
-            out: list[str] = []
-            for key in ("content", "text", "summary", "description", "title", "value"):
-                if key in value:
-                    out.extend(PRDOrchestrator._collect_strings(value.get(key)))
-            for k, v in value.items():
-                if k in {"content", "text", "summary", "description", "title", "value"}:
-                    continue
-                out.extend(PRDOrchestrator._collect_strings(v))
-            return out
-        return []
+        if not isinstance(parsed, dict):
+            raise ValueError("Structured output must be a JSON object")
+        parsed = cls._sanitize_obj(parsed)
+        parsed = cls._coerce_schema_lists(parsed, schema)
+        try:
+            return schema.model_validate(parsed)
+        except ValidationError as exc:
+            raise ValueError(str(exc))
 
     @classmethod
-    def _coerce_stage_output(cls, schema: Type[BaseModel], parsed_json: Any) -> BaseModel:
-        if schema is TextSection:
-            if isinstance(parsed_json, dict) and isinstance(parsed_json.get("content"), str):
-                return TextSection(content=cls._sanitize_generated_text(parsed_json["content"]))
-            strings = cls._collect_strings(parsed_json)
-            return TextSection(
-                content=cls._sanitize_generated_text(strings[0] if strings else "Insufficient information provided")
-            )
+    def _parse_loose_by_schema(cls, text: str, schema: type[BaseModel]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        fields = list(schema.model_fields.keys())
+        positions: list[tuple[str, int, int]] = []
+        for key in fields:
+            m = re.search(rf'"{re.escape(key)}"\s*:', text)
+            if m:
+                positions.append((key, m.start(), m.end()))
+        if not positions:
+            raise ValueError("No schema keys found in model output")
+        positions.sort(key=lambda x: x[1])
 
-        if schema is ListSection:
-            if isinstance(parsed_json, dict) and isinstance(parsed_json.get("items"), list):
-                items = [cls._sanitize_generated_text(str(item)) for item in parsed_json["items"] if str(item).strip()]
-                return ListSection(items=items or ["Insufficient information provided"])
-            items = cls._collect_strings(parsed_json)
-            deduped: list[str] = []
-            seen: set[str] = set()
-            for item in items:
-                cleaned_item = cls._sanitize_generated_text(item)
-                if cleaned_item not in seen:
-                    seen.add(cleaned_item)
-                    deduped.append(cleaned_item)
-            return ListSection(items=deduped or ["Insufficient information provided"])
+        for idx, (key, _, end_pos) in enumerate(positions):
+            next_start = positions[idx + 1][1] if idx + 1 < len(positions) else len(text)
+            raw_value = text[end_pos:next_start].strip()
+            raw_value = raw_value.rstrip(",").strip()
+            payload[key] = cls._parse_loose_value(raw_value, schema, key)
+        return payload
 
-        return schema.model_validate(parsed_json)
+    @classmethod
+    def _parse_loose_value(cls, raw_value: str, schema: type[BaseModel], key: str) -> Any:
+        if not raw_value:
+            return "Insufficient information provided."
 
-    @staticmethod
-    def _compress_text(text: str, max_words: int) -> str:
-        words = (text or "").split()
-        if len(words) <= max_words:
-            return text
-        return " ".join(words[:max_words])
+        annotation = schema.model_fields[key].annotation
+        is_list = get_origin(annotation) is list
 
-    def _compress_input(self, payload: dict[str, Any]) -> dict[str, Any]:
-        compressed = dict(payload)
-        for key, value in list(compressed.items()):
-            if isinstance(value, str):
-                compressed[key] = self._compress_text(value, 250)
-            elif isinstance(value, list):
-                compact_items: list[str] = []
-                for item in value:
-                    if not isinstance(item, str):
-                        continue
-                    compact_items.append(self._compress_text(item, 30))
-                    if len(compact_items) >= 10:
-                        break
-                compressed[key] = compact_items
-        return compressed
+        value = raw_value.strip()
+        # Remove trailing braces that may belong to the outer object.
+        while value.endswith("}") and not value.startswith("{"):
+            value = value[:-1].rstrip()
 
-    @staticmethod
-    def _detect_hallucination(input_text: str, output_text: str) -> bool:
-        src = input_text.lower()
-        out = output_text.lower()
+        if value.startswith('"'):
+            # Best-effort string extraction even if closing quote is missing.
+            if len(value) >= 2 and value.endswith('"'):
+                inner = value[1:-1]
+            else:
+                inner = value[1:]
+            inner = inner.replace('\\"', '"').replace("\\n", "\n").replace("\\t", " ")
+            return cls._split_to_list(inner) if is_list else inner
 
-        in_numbers = set(re.findall(r"\\d+(?:[\\.,]\\d+)?", src))
-        out_numbers = set(re.findall(r"\\d+(?:[\\.,]\\d+)?", out))
-        if out_numbers - in_numbers:
-            return True
+        if value.startswith("["):
+            repaired = cls._repair_truncated_json(value)
+            try:
+                parsed = json.loads(repaired)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(repaired)
+                except Exception:
+                    parsed = cls._split_to_list(value)
+            if is_list:
+                return parsed if isinstance(parsed, list) else cls._split_to_list(str(parsed))
+            if isinstance(parsed, list):
+                return ", ".join([str(v) for v in parsed])
+            return str(parsed)
 
-        in_integrations = {name for name in KNOWN_INTEGRATIONS if name in src}
-        out_integrations = {name for name in KNOWN_INTEGRATIONS if name in out}
-        if out_integrations - in_integrations:
-            return True
+        if value.startswith("{"):
+            repaired = cls._repair_truncated_json(value)
+            try:
+                parsed = json.loads(repaired)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(repaired)
+                except Exception:
+                    parsed = value
+            if is_list and isinstance(parsed, dict):
+                return [f"{k}: {v}" for k, v in parsed.items()]
+            return parsed if not is_list else cls._split_to_list(str(parsed))
 
-        if "%" in out and "%" not in src:
-            return True
-        if re.search(r"[$€£₹]", out) and not re.search(r"[$€£₹]", src):
-            return True
-        return False
+        return cls._split_to_list(value) if is_list else value
 
-    def _provider_config(self, model_name: str) -> tuple[str, str, str | None, str]:
+    def _provider_config(self) -> tuple[str, str, str | None, str]:
         provider = (settings.llm_provider or "").strip().lower()
         if provider == "lmstudio":
             return (
-                settings.lmstudio_model or model_name,
+                settings.lmstudio_model or settings.llm_model,
                 settings.llm_api_key or "lm-studio",
                 settings.lmstudio_base_url,
                 "lmstudio",
             )
         if provider == "huggingface":
             return (
-                settings.hf_openai_model or model_name,
+                settings.hf_openai_model or settings.llm_model,
                 settings.hf_api_token,
                 settings.hf_router_base_url,
                 "huggingface",
             )
-        return (model_name, settings.llm_api_key, settings.llm_base_url, "default")
+        return (settings.llm_model, settings.llm_api_key, settings.llm_base_url, "default")
+
+    @staticmethod
+    def _normalize_openai_base_url(base_url: str | None, provider: str) -> str | None:
+        if not base_url:
+            return base_url
+        normalized = base_url.rstrip("/")
+        if provider == "lmstudio":
+            # LM Studio OpenAI-compatible endpoint is /v1/chat/completions.
+            # Accept root, /api/v1, or /v1 and normalize to /v1.
+            if normalized.endswith("/api/v1"):
+                normalized = normalized[: -len("/api/v1")] + "/v1"
+            elif not normalized.endswith("/v1"):
+                normalized = normalized + "/v1"
+        return normalized
 
     async def _invoke_llm(self, prompt: str, output_tokens: int) -> tuple[str, int, str]:
-        model_name, api_key, base_url, provider = self._provider_config(settings.llm_model)
+        model_name, api_key, base_url, provider = self._provider_config()
         if not api_key:
             raise ValueError("LLM API key not configured")
 
-        if provider == "lmstudio":
-            url = f"{(base_url or '').rstrip('/')}{settings.lmstudio_chat_path}"
-            body = {
-                "model": model_name,
-                "input": prompt,
-                "temperature": 0.2,
-                "context_length": max(6000, MAX_STAGE_INPUT_TOKENS + output_tokens),
-            }
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                response = await client.post(
-                    url,
-                    json=body,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                response.raise_for_status()
-                payload = response.json()
-            output = payload.get("output")
-            text = ""
-            if isinstance(output, list):
-                lines = []
-                for item in output:
-                    if isinstance(item, dict) and isinstance(item.get("content"), str):
-                        lines.append(item["content"].strip())
-                text = "\n".join([line for line in lines if line]).strip()
-            usage = payload.get("stats") if isinstance(payload, dict) else {}
-            if isinstance(usage, dict):
-                tokens_used = int((usage.get("input_tokens") or 0) + (usage.get("total_output_tokens") or 0))
-            else:
-                tokens_used = self._estimate_tokens(prompt + "\n" + text)
-            return text, tokens_used, model_name
-
+        normalized_base_url = self._normalize_openai_base_url(base_url, provider)
         llm = ChatOpenAI(
             model=model_name,
             temperature=0.2,
             top_p=0.8,
             max_tokens=output_tokens,
             api_key=api_key,
-            base_url=base_url,
+            base_url=normalized_base_url,
         )
-        message = await llm.ainvoke(prompt)
-        content = (getattr(message, "content", "") or "").strip()
-        usage = getattr(message, "response_metadata", {}) or {}
-        token_usage = usage.get("token_usage") or usage.get("usage") or {}
-        tokens_used = int(token_usage.get("total_tokens") or 0) or self._estimate_tokens(prompt + "\n" + content)
-        return content, tokens_used, model_name
+        msg = await llm.ainvoke(prompt)
+        text = (getattr(msg, "content", "") or "").strip()
+        meta = getattr(msg, "response_metadata", {}) or {}
+        usage = meta.get("token_usage") or meta.get("usage") or {}
+        tokens_used = int(usage.get("total_tokens") or 0) or self._estimate_tokens(prompt + "\n" + text)
+        return text, max(tokens_used, 1), model_name
+
+    def _bounded_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw = json.dumps(payload, ensure_ascii=False)
+        if self._estimate_tokens(raw) <= MAX_STAGE_INPUT_TOKENS:
+            return payload
+
+        compressed: dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                compressed[key] = TokenLimiter.compress_text(value, max_tokens=250)
+            elif isinstance(value, list):
+                trimmed: list[Any] = []
+                for item in value[:30]:
+                    if isinstance(item, str):
+                        trimmed.append(TokenLimiter.compress_text(item, max_tokens=40))
+                    elif isinstance(item, dict):
+                        trimmed.append({k: TokenLimiter.compress_text(str(v), max_tokens=25) for k, v in item.items()})
+                    else:
+                        trimmed.append(item)
+                compressed[key] = trimmed
+            else:
+                compressed[key] = value
+
+        if self._estimate_tokens(json.dumps(compressed, ensure_ascii=False)) > MAX_STAGE_INPUT_TOKENS:
+            raise ValueError("Input token budget exceeded after compression")
+        return compressed
 
     async def _run_stage(
         self,
         stage_name: str,
-        schema: Type[BaseModel],
+        schema: type[BaseModel],
+        stage_instruction: str,
         payload: dict[str, Any],
-        stage_instructions: str,
     ) -> StageRunResult:
-        logger.warning("prd_multistep_stage_start stage=%s", stage_name)
-        await self._emit_progress(
-            {
-                "stage": stage_name,
-                "status": "running",
-            }
-        )
-        source_payload = payload
-        input_json = json.dumps(source_payload, ensure_ascii=True)
+        await self._check_control(stage_name)
+        await self._emit_progress({"stage": stage_name, "status": "running"})
+
+        source = self._bounded_payload(payload)
+        input_json = json.dumps(source, ensure_ascii=False, indent=2)
         input_tokens = self._estimate_tokens(input_json)
-        if input_tokens > MAX_STAGE_INPUT_TOKENS:
-            source_payload = self._compress_input(source_payload)
-            input_json = json.dumps(source_payload, ensure_ascii=True)
-            input_tokens = self._estimate_tokens(input_json)
         self.limiter.enforce(input_tokens=input_tokens, output_tokens=MAX_STAGE_OUTPUT_TOKENS)
 
-        base_prompt = (
-            f"System Rules: {STRICT_PROMPT}\\n"
-            f"Document Standard: {DOC_STYLE_GUIDE}\\n"
-            f"Stage: {stage_name}\\n"
-            f"Instructions: {stage_instructions}\\n"
-            f"Return JSON object only with this schema keys: {', '.join(schema.model_fields.keys())}.\\n"
-            "Do not include markdown, explanations, code fences, or extra keys.\\n\\n"
-            f"Input JSON:\\n{json.dumps(source_payload, ensure_ascii=False, indent=2)}"
+        prompt = (
+            f"System: {SYSTEM_CONTENT_ONLY}\n"
+            f"Style: {DOC_STYLE_GUIDE}\n"
+            f"Depth: {DETAIL_DEPTH_GUIDE}\n"
+            f"Stage: {stage_name}\n"
+            f"Task: {stage_instruction}\n"
+            "Rules: output valid JSON only. no prose outside JSON. no section headers.\n"
+            f"Allowed keys: {', '.join(schema.model_fields.keys())}\n\n"
+            f"Input:\n{input_json}"
         )
 
         retry_count = 0
         last_error: Exception | None = None
+
         for attempt in range(2):
-            stronger = "" if attempt == 0 else "\\nIMPORTANT: You introduced unsupported details previously. Remove all unsupported details."
-            prompt = base_prompt + stronger
+            await self._check_control(stage_name)
             raw_text, used_tokens, model_name = await self._invoke_llm(prompt, MAX_STAGE_OUTPUT_TOKENS)
             self.total_tokens_used += used_tokens
             try:
-                parsed = self._parse_stage_output(schema, raw_text)
-                if self._detect_hallucination(input_json, parsed.model_dump_json()):
-                    if attempt == 0:
-                        retry_count = 1
-                        continue
-                    raise ValueError("Hallucination suspected")
+                parsed = self._parse_structured(raw_text, schema)
+                output_tokens = max(1, used_tokens - input_tokens)
                 await log_llm_usage(
                     feature=f"prd_multistep:{stage_name}",
                     model=model_name,
                     input_tokens=input_tokens,
-                    output_tokens=max(1, used_tokens - input_tokens),
+                    output_tokens=output_tokens,
                     tenant_id=self.tenant_id,
                     stage_name=stage_name,
                     retry_count=retry_count,
-                )
-                logger.warning(
-                    "prd_multistep_stage_done stage=%s input_tokens=%s output_tokens=%s retry=%s",
-                    stage_name,
-                    input_tokens,
-                    used_tokens,
-                    retry_count,
                 )
                 await self._emit_progress(
                     {
                         "stage": stage_name,
                         "status": "completed",
                         "input_tokens": input_tokens,
-                        "output_tokens": max(1, used_tokens - input_tokens),
+                        "output_tokens": output_tokens,
                         "retry_count": retry_count,
+                        "stage_output": self._progress_payload_from_model(parsed),
                     }
                 )
-                return StageRunResult(parsed, input_tokens, used_tokens, retry_count)
+                return StageRunResult(output=parsed, input_tokens=input_tokens, output_tokens=output_tokens, retry_count=retry_count)
             except Exception as exc:
                 last_error = exc
                 retry_count = 1
+                logger.warning("prd_stage_validation_failed stage=%s attempt=%s error=%s", stage_name, attempt + 1, exc)
 
-        await self._emit_progress(
-            {
-                "stage": stage_name,
-                "status": "failed",
-                "error": str(last_error),
-            }
-        )
+        await self._emit_progress({"stage": stage_name, "status": "failed", "error": str(last_error)})
         raise ValueError(f"{stage_name} failed: {last_error}")
 
-    async def _run_text_section(self, stage_name: str, payload: dict[str, Any], instruction: str) -> str:
-        result = await self._run_stage(stage_name, TextSection, payload, instruction)
-        content = re.sub(r"\s+", " ", (result.output.content or "")).strip()
-        return content if content else "Insufficient information provided"
-
-    async def _run_list_section(self, stage_name: str, payload: dict[str, Any], instruction: str) -> list[str]:
-        result = await self._run_stage(stage_name, ListSection, payload, instruction)
-        items = [item.strip() for item in (result.output.items or []) if isinstance(item, str) and item.strip()]
-        return self._clean_list_items(items)
-
-    async def generate_core_sections(self, payload: dict[str, Any]) -> dict[str, Any]:
-        sections = {
-            "executive_summary": await self._run_text_section(
-                "stage_1_executive_summary",
-                {"title": payload["title"], "problem_statement": payload["problem_statement"], "target_users": payload["target_users"]},
-                "Write Executive Summary in 2-3 paragraphs. Include: product purpose, value proposition, and stage focus.",
+    async def generate_content(self, payload: dict[str, Any]) -> PRDContent:
+        stage1 = await self._run_stage(
+            stage_name="stage_1_core_context",
+            schema=Stage1Output,
+            stage_instruction=(
+                "Fill only these fields: executive_summary, core_problem, why_tools_fail, success_meaning, "
+                "primary_objective, success_metrics, leading_indicators, personas. "
+                "For personas, create exactly 3 entries aligned to engineering lead, product manager, CTO/founder. "
+                "Executive summary and problem fields must be detailed and decision-history focused."
             ),
-            "problem_statement": await self._run_text_section(
-                "stage_2_problem_statement",
-                {"problem_statement": payload["problem_statement"], "additional_notes": payload.get("additional_notes", "")},
-                "Write Problem Statement with two subparts: 'The Core Problem' and 'Why Existing Approaches Fail'.",
-            ),
-            "target_users_personas": await self._run_list_section(
-                "stage_3_target_users_personas",
-                {"target_users": payload["target_users"], "problem_statement": payload["problem_statement"]},
-                "List 3-6 personas. Each item should include role + pain + goal in one line.",
-            ),
-            "objectives_success_metrics": await self._run_list_section(
-                "stage_4_objectives_success_metrics",
-                {"features": payload["features"], "additional_notes": payload.get("additional_notes", "")},
-                "List 5-10 objectives and success metrics. Prefer measurable targets if present in input.",
-            ),
-        }
-        if self._should_run_detail_pass(payload):
-            sections["executive_summary"] = await self._expand_text_section(
-                "stage_1b_executive_summary_expand",
-                payload,
-                sections["executive_summary"],
-                "Improve precision and business clarity in the executive summary.",
-            )
-            sections["problem_statement"] = await self._expand_text_section(
-                "stage_2b_problem_statement_expand",
-                payload,
-                sections["problem_statement"],
-                "Refine pain points, current-state gaps, and impact without adding new facts.",
-            )
-            sections["objectives_success_metrics"] = await self._expand_list_section(
-                "stage_4b_objectives_success_metrics_expand",
-                payload,
-                sections["objectives_success_metrics"],
-                "Improve objective/metric quality; keep measurable wording where possible.",
-            )
-        return sections
-
-    async def generate_feature_sections(self, payload: dict[str, Any]) -> dict[str, Any]:
-        sections = {
-            "feature_overview": await self._run_list_section(
-                "stage_5_feature_overview",
-                {"features": payload["features"], "problem_statement": payload["problem_statement"]},
-                "List 8-12 Feature Overview items, grouped logically by capability in wording.",
-            ),
-            "out_of_scope": await self._run_list_section(
-                "stage_6_out_of_scope",
-                {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List Out-of-scope items only if explicitly mentioned or safely implied by provided context.",
-            ),
-        }
-        if self._should_run_detail_pass(payload):
-            sections["feature_overview"] = await self._expand_list_section(
-                "stage_5b_feature_overview_expand",
-                payload,
-                sections["feature_overview"],
-                "Increase functional clarity and acceptance-oriented wording for each feature.",
-            )
-        return sections
-
-    async def generate_architecture_sections(self, payload: dict[str, Any]) -> dict[str, Any]:
-        sections = {
-            "architecture_decisions": await self._run_list_section(
-                "stage_7_architecture_decisions",
-                {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List 6-12 Architecture Decisions using decision-style phrasing (what + why).",
-            ),
-            "technical_architecture": await self._run_list_section(
-                "stage_8_technical_architecture",
-                {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List 8-12 Technical Architecture details: components, data flow, and integration boundaries.",
-            ),
-            "deployment_strategy": await self._run_list_section(
-                "stage_9_deployment_strategy",
-                {"additional_notes": payload.get("additional_notes", "")},
-                "List 5-10 Deployment Strategy details: environment, release flow, rollback, observability.",
-            ),
-        }
-        if self._should_run_detail_pass(payload):
-            sections["architecture_decisions"] = await self._expand_list_section(
-                "stage_7b_architecture_decisions_expand",
-                payload,
-                sections["architecture_decisions"],
-                "Improve decision rationale and operational specificity.",
-            )
-            sections["technical_architecture"] = await self._expand_list_section(
-                "stage_8b_technical_architecture_expand",
-                payload,
-                sections["technical_architecture"],
-                "Improve module boundaries, interfaces, and data flow clarity.",
-            )
-        return sections
-
-    async def generate_nonfunctional_sections(self, payload: dict[str, Any]) -> dict[str, Any]:
-        sections = {
-            "non_functional_requirements": await self._run_list_section(
-                "stage_10_non_functional_requirements",
-                {"additional_notes": payload.get("additional_notes", ""), "problem_statement": payload["problem_statement"]},
-                "List 8-12 Non-Functional Requirements with concrete quality expectations.",
-            ),
-            "security_compliance": await self._run_list_section(
-                "stage_11_security_compliance",
-                {"additional_notes": payload.get("additional_notes", "")},
-                "List 6-10 Security & Compliance requirements from provided context only.",
-            ),
-        }
-        if self._should_run_detail_pass(payload):
-            sections["non_functional_requirements"] = await self._expand_list_section(
-                "stage_10b_non_functional_requirements_expand",
-                payload,
-                sections["non_functional_requirements"],
-                "Improve measurable quality criteria and operational validation language.",
-            )
-        return sections
-
-    async def generate_risk_sections(self, payload: dict[str, Any]) -> dict[str, Any]:
-        sections = {
-            "scalability_considerations": await self._run_list_section(
-                "stage_12_scalability_considerations",
-                {"features": payload["features"], "additional_notes": payload.get("additional_notes", "")},
-                "List 6-10 Scalability Considerations aligned with expected usage patterns.",
-            ),
-            "risks_mitigation": await self._run_list_section(
-                "stage_13_risks_mitigation",
-                {"features": payload["features"], "additional_notes": payload.get("additional_notes", "")},
-                "List 6-12 Risks & Mitigation items as actionable paired bullets.",
-            ),
-            "constraints": await self._run_list_section(
-                "stage_14_constraints",
-                {"additional_notes": payload.get("additional_notes", ""), "features": payload["features"]},
-                "List 6-10 delivery/business/technical constraints.",
-            ),
-            "definition_of_done": await self._run_list_section(
-                "stage_15_definition_of_done",
-                {"features": payload["features"], "problem_statement": payload["problem_statement"]},
-                "List 8-12 Definition of Done criteria that are verifiable and release-ready.",
-            ),
-        }
-        if self._should_run_detail_pass(payload):
-            sections["risks_mitigation"] = await self._expand_list_section(
-                "stage_13b_risks_mitigation_expand",
-                payload,
-                sections["risks_mitigation"],
-                "Improve risk articulation and mitigation actionability.",
-            )
-            sections["definition_of_done"] = await self._expand_list_section(
-                "stage_15b_definition_of_done_expand",
-                payload,
-                sections["definition_of_done"],
-                "Improve verifiability and release-readiness of done criteria.",
-            )
-        return sections
-
-    @staticmethod
-    def _bullets(items: list[str]) -> str:
-        clean = [item.strip() for item in items if item and item.strip()]
-        return "\\n".join([f"- {item}" for item in clean]) if clean else "- Insufficient information provided"
-
-    @staticmethod
-    def _phased_plan(
-        feature_items: list[str],
-        architecture_items: list[str],
-        nonfunctional_items: list[str],
-    ) -> str:
-        f = [x for x in feature_items if x and x.strip()]
-        a = [x for x in architecture_items if x and x.strip()]
-        n = [x for x in nonfunctional_items if x and x.strip()]
-        p1 = f[:3] + a[:2]
-        p2 = f[3:7] + a[2:5]
-        p3 = f[7:10] + n[:3]
-        return (
-            "### Phase 1 — Foundation\n"
-            + ("\n".join([f"- {x}" for x in (p1 or ["Insufficient information provided"])]) + "\n\n")
-            + "### Phase 2 — Core Workflow Completion\n"
-            + ("\n".join([f"- {x}" for x in (p2 or ["Insufficient information provided"])]) + "\n\n")
-            + "### Phase 3 — Hardening and Launch Readiness\n"
-            + ("\n".join([f"- {x}" for x in (p3 or ["Insufficient information provided"])]))
-        )
-
-    @staticmethod
-    def _metrics_table(metrics: list[str]) -> str:
-        rows = [m for m in metrics if m and m.strip()]
-        if not rows:
-            return "| Metric | Target |\n|---|---|\n| Insufficient information provided | Insufficient information provided |"
-        lines = ["| Metric | Target |", "|---|---|"]
-        for item in rows[:10]:
-            parts = [p.strip() for p in re.split(r"[:\-]", item, maxsplit=1) if p.strip()]
-            if len(parts) == 2:
-                metric, target = parts
-            else:
-                metric, target = item.strip(), "As provided"
-            lines.append(f"| {metric} | {target} |")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _risk_table(risks: list[str]) -> str:
-        rows = [r for r in risks if r and r.strip()]
-        if not rows:
-            return "| Risk | Mitigation |\n|---|---|\n| Insufficient information provided | Insufficient information provided |"
-        lines = ["| Risk | Mitigation |", "|---|---|"]
-        for item in rows[:10]:
-            parts = [p.strip() for p in re.split(r"[:\-]", item, maxsplit=1) if p.strip()]
-            if len(parts) == 2:
-                risk, mitigation = parts
-            else:
-                risk, mitigation = item.strip(), "Mitigation to be defined during implementation"
-            lines.append(f"| {risk} | {mitigation} |")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _feature_blocks(features: list[str]) -> str:
-        clean = [f for f in features if f and f.strip()]
-        if not clean:
-            return "### Core Features\n- Insufficient information provided"
-        lines: list[str] = []
-        for idx, item in enumerate(clean[:12], 1):
-            lines.append(f"### {idx}. {item[:80]}")
-            lines.append(f"- {item}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _user_stories(features: list[str]) -> str:
-        clean = [f for f in features if f and f.strip()]
-        if not clean:
-            return "- As a user, I need clear decision records so I can understand context."
-        lines: list[str] = []
-        for idx, item in enumerate(clean[:6], 1):
-            lines.append(f"- **US-{idx}:** As a user, I want {item.lower()} so the team can preserve decision context.")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _clean_list_items(items: list[str], max_items: int = 10) -> list[str]:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for raw in items:
-            text = (raw or "").strip()
-            if not text:
-                continue
-            text = re.sub(r"\s+", " ", text)
-            text = re.sub(r"^[\-\*\d\.\)\s]+", "", text).strip()
-            if len(text) < 5:
-                continue
-            key = text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(text)
-            if len(cleaned) >= max_items:
-                break
-        return cleaned or ["Insufficient information provided"]
-
-    def _should_run_detail_pass(self, payload: dict[str, Any]) -> bool:
-        text = " ".join(
-            [
-                str(payload.get("title") or ""),
-                str(payload.get("problem_statement") or ""),
-                str(payload.get("target_users") or ""),
-                " ".join([str(x) for x in payload.get("features", []) if x]),
-                str(payload.get("additional_notes") or ""),
-            ]
-        ).strip()
-        # If source context is rich, run additional quality expansion calls.
-        return self._estimate_tokens(text) >= 450
-
-    async def _expand_text_section(
-        self,
-        stage_name: str,
-        payload: dict[str, Any],
-        seed_text: str,
-        instruction: str,
-    ) -> str:
-        expanded = await self._run_text_section(
-            stage_name,
-            {
-                "seed_text": seed_text,
-                "input_context": payload,
+            payload={
+                "title": payload["title"],
+                "problem_statement": payload["problem_statement"],
+                "target_users": payload["target_users"],
+                "features": payload["features"],
+                "additional_notes": payload.get("additional_notes", ""),
             },
-            f"{DETAIL_PROMPT} {instruction}",
         )
-        return expanded if expanded else seed_text
 
-    async def _expand_list_section(
-        self,
-        stage_name: str,
-        payload: dict[str, Any],
-        seed_items: list[str],
-        instruction: str,
-    ) -> list[str]:
-        expanded = await self._run_list_section(
-            stage_name,
-            {
-                "seed_items": seed_items,
-                "input_context": payload,
+        stage2 = await self._run_stage(
+            stage_name="stage_2_scope_user_stories",
+            schema=Stage2Output,
+            stage_instruction=(
+                "Fill only in_scope_features, out_of_scope, user_stories. "
+                "Return exactly 12 user stories with IDs US-1.1..US-4.3 and practical acceptance criteria. "
+                "Each acceptance criteria list should include measurable, testable statements."
+            ),
+            payload={
+                "title": payload["title"],
+                "problem_statement": payload["problem_statement"],
+                "target_users": payload["target_users"],
+                "features": payload["features"],
+                "additional_notes": payload.get("additional_notes", ""),
             },
-            f"{DETAIL_PROMPT} {instruction}",
         )
-        return self._clean_list_items(seed_items + expanded, max_items=12)
 
-    def merge_markdown(
-        self,
-        core: dict[str, Any],
-        feature: dict[str, Any],
-        architecture: dict[str, Any],
-        nonfunctional: dict[str, Any],
-        risk: dict[str, Any],
-        project_title: str,
-    ) -> str:
-        today = datetime.now(timezone.utc).strftime("%B %d, %Y")
-        stage_title = "DecisionVault — Stage 1: Decision History Core"
-        features = feature.get("feature_overview", [])
-        arch = architecture.get("architecture_decisions", [])
-        tech = architecture.get("technical_architecture", [])
-        deploy = architecture.get("deployment_strategy", [])
-        nfr = nonfunctional.get("non_functional_requirements", [])
-        sec = nonfunctional.get("security_compliance", [])
-        risks = risk.get("risks_mitigation", [])
-        constraints = risk.get("constraints", [])
-        dod = risk.get("definition_of_done", [])
-        scalability = risk.get("scalability_considerations", [])
-        users = core.get("target_users_personas", [])
-        metrics = core.get("objectives_success_metrics", [])
-        out_scope = feature.get("out_of_scope", [])
+        stage3 = await self._run_stage(
+            stage_name="stage_3_architecture",
+            schema=Stage3Output,
+            stage_instruction=(
+                "Fill architecture_summary, data_model_summary, api_summary, slack_integration_summary, security_summary. "
+                "Keep statements implementation-oriented and consistent with provided stack and features only. "
+                "Include concrete architecture boundaries, key entities, and API route patterns."
+            ),
+            payload={
+                "title": payload["title"],
+                "problem_statement": payload["problem_statement"],
+                "target_users": payload["target_users"],
+                "features": payload["features"],
+                "additional_notes": payload.get("additional_notes", ""),
+            },
+        )
 
-        markdown = f"""# 1. Product Requirements Document (PRD)
-## 1.1 {stage_title}
-**Version:** 1.0
-**Date:** {today}
-**Status:** Draft for Development
-**Owner:** Product Team
-**Contributors:** Engineering, Design
+        stage4 = await self._run_stage(
+            stage_name="stage_4_delivery_quality",
+            schema=Stage4Output,
+            stage_instruction=(
+                "Fill ui_summary, dependencies_summary, non_functional_summary, testing_summary, launch_plan_summary, "
+                "open_questions, assumptions, risks, definition_of_done, glossary. "
+                "Provide actionable release-quality detail, not short placeholders."
+            ),
+            payload={
+                "title": payload["title"],
+                "problem_statement": payload["problem_statement"],
+                "target_users": payload["target_users"],
+                "features": payload["features"],
+                "additional_notes": payload.get("additional_notes", ""),
+            },
+        )
 
-## 2. Executive Summary
-{core['executive_summary']}
+        return PRDContent(
+            executive_summary=stage1.output.executive_summary,
+            core_problem=stage1.output.core_problem,
+            why_tools_fail=stage1.output.why_tools_fail,
+            success_meaning=stage1.output.success_meaning,
+            primary_objective=stage1.output.primary_objective,
+            success_metrics=stage1.output.success_metrics,
+            leading_indicators=stage1.output.leading_indicators,
+            personas=stage1.output.personas,
+            in_scope_features=stage2.output.in_scope_features,
+            out_of_scope=stage2.output.out_of_scope,
+            user_stories=stage2.output.user_stories,
+            architecture_summary=stage3.output.architecture_summary,
+            data_model_summary=stage3.output.data_model_summary,
+            api_summary=stage3.output.api_summary,
+            slack_integration_summary=stage3.output.slack_integration_summary,
+            security_summary=stage3.output.security_summary,
+            ui_summary=stage4.output.ui_summary,
+            dependencies_summary=stage4.output.dependencies_summary,
+            non_functional_summary=stage4.output.non_functional_summary,
+            testing_summary=stage4.output.testing_summary,
+            launch_plan_summary=stage4.output.launch_plan_summary,
+            open_questions=stage4.output.open_questions,
+            assumptions=stage4.output.assumptions,
+            risks=stage4.output.risks,
+            definition_of_done=stage4.output.definition_of_done,
+            glossary=stage4.output.glossary,
+        )
 
-## 3. Problem Statement
-### 3.1 The Core Problem
-{core['problem_statement']}
 
-### 3.2 Why Existing Tools Fail
-{self._bullets(out_scope)}
+def _bullets(items: list[str]) -> str:
+    clean = [item.strip() for item in items if isinstance(item, str) and item.strip()]
+    if not clean:
+        return "- Insufficient information provided."
+    return "\n".join([f"- {item}" for item in clean])
 
-### 3.3 Success Will Mean
-{self._bullets(metrics)}
 
-## 4. Objectives and Success Metrics
-### 4.1 Primary Objective
-{core['executive_summary']}
+def _split_sentences(text: str, max_items: int = 4) -> list[str]:
+    if not isinstance(text, str) or not text.strip():
+        return ["Insufficient information provided."]
+    parts = [p.strip(" -") for p in re.split(r"[.;\n]+", text) if p.strip()]
+    if not parts:
+        return ["Insufficient information provided."]
+    return parts[:max_items]
 
-### 4.2 Success Metrics (Stage 1 MVP)
-{self._metrics_table(metrics)}
 
-### 4.3 Leading Indicators (Early Validation)
-{self._bullets(metrics)}
+def _feature_slice(features: list[str], start: int, count: int) -> list[str]:
+    sliced = [f.strip() for f in features[start : start + count] if isinstance(f, str) and f.strip()]
+    return sliced or ["Insufficient information provided."]
 
-## 5. Target Users and Personas
-### 5.1 Primary Persona: Sarah — Engineering Lead
-{self._bullets(users[:2] or users)}
 
-### 5.2 Secondary Persona: David — Product Manager
-{self._bullets(users[2:4] or users)}
+def _map_personas(personas: list[Persona]) -> list[Persona]:
+    defaults = [
+        Persona(name="Sarah", role="Engineering Lead", description="Insufficient information provided."),
+        Persona(name="David", role="Product Manager", description="Insufficient information provided."),
+        Persona(name="Maya", role="Startup CTO/Founder", description="Insufficient information provided."),
+    ]
+    mapped = list(personas[:3])
+    while len(mapped) < 3:
+        mapped.append(defaults[len(mapped)])
+    return mapped
 
-### 5.3 Tertiary Persona: Maya — Startup CTO/Founder
-{self._bullets(users[4:6] or users)}
 
-## 6. Product Scope: Stage 1 Features
-### 6.1 In Scope (Must Have for MVP)
-#### 6.1.1 Decision Capture System
-##### Slack Thread Capture
-{self._bullets(features[:2])}
-##### Manual Document Upload
-{self._bullets(features[2:4])}
-##### Structured Decision Entry Form
-{self._bullets(features[4:6])}
+def _story_map(stories: list[UserStory]) -> dict[str, UserStory]:
+    ids = [
+        "US-1.1", "US-1.2", "US-1.3", "US-2.1", "US-2.2", "US-2.3",
+        "US-3.1", "US-3.2", "US-3.3", "US-4.1", "US-4.2", "US-4.3",
+    ]
+    source = {s.id.strip().upper(): s for s in stories if isinstance(s.id, str) and s.id.strip()}
+    filler = iter(stories)
+    for sid in ids:
+        if sid in source:
+            continue
+        try:
+            candidate = next(filler)
+            source[sid] = UserStory(id=sid, description=candidate.description, acceptance_criteria=candidate.acceptance_criteria)
+        except StopIteration:
+            source[sid] = UserStory(id=sid, description="Insufficient information provided.", acceptance_criteria=[])
+    return source
 
-#### 6.1.2 Decision Record Storage
-##### Immutable Decision Records
-{self._bullets(features[6:7])}
-##### Versioning System
-{self._bullets(features[7:8])}
-##### Evidence Linking
-{self._bullets(features[8:9])}
 
-#### 6.1.3 Decision Timeline View
-##### Project Timeline
-{self._bullets(features[9:10])}
-##### Evolution Visualization
-{self._bullets(features[10:11])}
+def render_hierarchical_prd(prd: PRDContent, today: str) -> str:
+    personas = _map_personas(prd.personas)
+    stories = _story_map(prd.user_stories)
 
-#### 6.1.4 "Why Did We...?" Query System
-##### Natural Language Search
-{self._bullets(features[11:12])}
-##### Evidence-First Results
-{self._bullets(features[:1])}
-##### Query Analytics (Admin View)
-{self._bullets(metrics[:2])}
+    md = ""
+    md += "# 1. Product Requirements Document (PRD)\n"
+    md += "## 1.1 DecisionVault — Stage 1: Decision History Core\n"
+    md += "**Version:** 1.0\n"
+    md += f"**Date:** {today}\n"
+    md += "**Status:** Draft for Development\n"
+    md += "**Owner:** Product Team\n"
+    md += "**Contributors:** Engineering, Design\n\n"
 
-#### 6.1.5 Multi-Tenant Foundation
-##### Tenant Architecture
-{self._bullets(arch[:2])}
-##### Project Hierarchy
-{self._bullets(arch[2:4])}
-##### User Management
-{self._bullets(arch[4:5])}
-##### Role-Based Access Control (RBAC)
-{self._bullets(arch[5:6])}
+    md += "## 2. Executive Summary\n"
+    md += f"{prd.executive_summary}\n\n"
 
-#### 6.1.6 License and Trial System
-##### Trial Mode
-{self._bullets(constraints[:2])}
-##### Paid Licensing
-{self._bullets(constraints[2:4])}
-##### Billing Integration
-{self._bullets(constraints[4:5])}
+    md += "## 3. Problem Statement\n"
+    md += f"### 3.1 The Core Problem\n{prd.core_problem}\n\n"
+    md += f"### 3.2 Why Existing Tools Fail\n{prd.why_tools_fail}\n\n"
+    md += f"### 3.3 Success Will Mean\n{prd.success_meaning}\n\n"
 
-### 6.2 Out of Scope (Stage 1)
-{self._bullets(out_scope)}
+    md += "## 4. Objectives and Success Metrics\n"
+    md += f"### 4.1 Primary Objective\n{prd.primary_objective}\n\n"
+    md += "### 4.2 Success Metrics (Stage 1 MVP)\n"
+    md += _bullets(prd.success_metrics) + "\n\n"
+    md += "### 4.3 Leading Indicators (Early Validation)\n"
+    md += _bullets(prd.leading_indicators) + "\n\n"
 
-## 7. User Stories and Use Cases
-### 7.1 Epic 1: Decision Capture
-#### US-1.1
-{features[0] if len(features) > 0 else "Insufficient information provided"}
-#### US-1.2
-{features[1] if len(features) > 1 else "Insufficient information provided"}
-#### US-1.3
-{features[2] if len(features) > 2 else "Insufficient information provided"}
+    md += "## 5. Target Users and Personas\n"
+    md += "### 5.1 Primary Persona: Sarah — Engineering Lead\n"
+    md += f"{personas[0].description}\nPain Points:\n{_bullets(personas[0].pain_points)}\nGoals:\n{_bullets(personas[0].goals)}\n\n"
+    md += "### 5.2 Secondary Persona: David — Product Manager\n"
+    md += f"{personas[1].description}\nPain Points:\n{_bullets(personas[1].pain_points)}\nGoals:\n{_bullets(personas[1].goals)}\n\n"
+    md += "### 5.3 Tertiary Persona: Maya — Startup CTO/Founder\n"
+    md += f"{personas[2].description}\nPain Points:\n{_bullets(personas[2].pain_points)}\nGoals:\n{_bullets(personas[2].goals)}\n\n"
 
-### 7.2 Epic 2: Decision Retrieval
-#### US-2.1
-{features[3] if len(features) > 3 else "Insufficient information provided"}
-#### US-2.2
-{features[4] if len(features) > 4 else "Insufficient information provided"}
-#### US-2.3
-{features[5] if len(features) > 5 else "Insufficient information provided"}
+    md += "## 6. Product Scope: Stage 1 Features\n"
+    md += "### 6.1 In Scope (Must Have for MVP)\n"
+    md += "#### 6.1.1 Decision Capture System\n"
+    md += f"##### Slack Thread Capture\n{_bullets(_feature_slice(prd.in_scope_features, 0, 3))}\n"
+    md += f"##### Manual Document Upload\n{_bullets(_feature_slice(prd.in_scope_features, 3, 3))}\n"
+    md += f"##### Structured Decision Entry Form\n{_bullets(_feature_slice(prd.in_scope_features, 6, 3))}\n"
 
-### 7.3 Epic 3: Decision Management
-#### US-3.1
-{features[6] if len(features) > 6 else "Insufficient information provided"}
-#### US-3.2
-{features[7] if len(features) > 7 else "Insufficient information provided"}
-#### US-3.3
-{features[8] if len(features) > 8 else "Insufficient information provided"}
+    md += "#### 6.1.2 Decision Record Storage\n"
+    md += f"##### Immutable Decision Records\n{_bullets(_feature_slice(prd.in_scope_features, 9, 2))}\n"
+    md += f"##### Versioning System\n{_bullets(_feature_slice(prd.in_scope_features, 11, 2))}\n"
+    md += f"##### Evidence Linking\n{_bullets(_feature_slice(prd.in_scope_features, 13, 2))}\n"
 
-### 7.4 Epic 4: Multi-Tenant Administration
-#### US-4.1
-{features[9] if len(features) > 9 else "Insufficient information provided"}
-#### US-4.2
-{features[10] if len(features) > 10 else "Insufficient information provided"}
-#### US-4.3
-{features[11] if len(features) > 11 else "Insufficient information provided"}
+    md += "#### 6.1.3 Decision Timeline View\n"
+    md += f"##### Project Timeline\n{_bullets(_feature_slice(prd.in_scope_features, 15, 2))}\n"
+    md += f"##### Evolution Visualization\n{_bullets(_feature_slice(prd.in_scope_features, 17, 2))}\n"
 
-## 8. Technical Architecture
-### 8.1 System Architecture Overview
-{self._bullets(arch)}
+    md += "#### 6.1.4 \"Why Did We...?\" Query System\n"
+    md += f"##### Natural Language Search\n{_bullets(_feature_slice(prd.in_scope_features, 19, 2))}\n"
+    md += f"##### Evidence-First Results\n{_bullets(_feature_slice(prd.in_scope_features, 21, 2))}\n"
+    md += f"##### Query Analytics (Admin View)\n{_bullets(_feature_slice(prd.in_scope_features, 23, 2))}\n"
 
-### 8.2 Data Model (Core Entities)
-#### Tenant (Organization)
-{self._bullets(arch[:1])}
-#### User
-{self._bullets(arch[1:2] or arch[:1])}
-#### Project
-{self._bullets(arch[2:3] or arch[:1])}
-#### Decision (Core Entity)
-{self._bullets(arch[3:4] or arch[:1])}
-#### Decision Relationship
-{self._bullets(arch[4:5] or arch[:1])}
-#### Integration (Slack)
-{self._bullets(arch[5:6] or arch[:1])}
+    md += "#### 6.1.5 Multi-Tenant Foundation\n"
+    md += f"##### Tenant Architecture\n{_bullets(_split_sentences(prd.architecture_summary))}\n"
+    md += f"##### Project Hierarchy\n{_bullets(_split_sentences(prd.data_model_summary))}\n"
+    md += f"##### User Management\n{_bullets(_split_sentences(prd.api_summary))}\n"
+    md += f"##### Role-Based Access Control (RBAC)\n{_bullets(_split_sentences(prd.security_summary))}\n"
 
-### 8.3 API Endpoints (Key Routes)
-#### Authentication
-{self._bullets(tech[:2])}
-#### Organizations
-{self._bullets(tech[2:4] or tech[:2])}
-#### Projects
-{self._bullets(tech[4:6] or tech[:2])}
-#### Decisions
-{self._bullets(tech[6:8] or tech[:2])}
-#### Search
-{self._bullets(tech[8:9] or tech[:2])}
-#### Integrations
-{self._bullets(tech[9:11] or tech[:2])}
-#### Billing
-{self._bullets(tech[11:12] or tech[:2])}
+    md += "#### 6.1.6 License and Trial System\n"
+    md += f"##### Trial Mode\n{_bullets(_feature_slice(prd.in_scope_features, 25, 2))}\n"
+    md += f"##### Paid Licensing\n{_bullets(_feature_slice(prd.in_scope_features, 27, 2))}\n"
+    md += f"##### Billing Integration\n{_bullets(_split_sentences(prd.dependencies_summary))}\n"
 
-### 8.4 Slack Integration Architecture
-#### OAuth Flow
-{self._bullets(deploy[:1])}
-#### Event Subscription Flow
-{self._bullets(deploy[1:2] or deploy[:1])}
-#### Slack Bot Permissions Required
-{self._bullets(deploy[2:3] or deploy[:1])}
-#### Data Privacy
-{self._bullets(sec[:1] or deploy[:1])}
+    md += "### 6.2 Out of Scope (Stage 1)\n"
+    md += _bullets(prd.out_of_scope) + "\n\n"
 
-### 8.5 Security and Compliance
-#### Data Security
-{self._bullets(sec[:2] or sec)}
-#### Authentication
-{self._bullets(sec[2:3] or sec[:1])}
-#### Access Control
-{self._bullets(sec[3:4] or sec[:1])}
-#### Compliance Considerations (Future)
-{self._bullets(sec[4:6] or sec[:1])}
+    md += "## 7. User Stories and Use Cases\n"
+    md += "### 7.1 Epic 1: Decision Capture\n"
+    for sid in ["US-1.1", "US-1.2", "US-1.3"]:
+        us = stories[sid]
+        md += f"#### {sid}\n{us.description}\nAcceptance Criteria:\n{_bullets(us.acceptance_criteria)}\n"
 
-## 9. User Interface Design
-### 9.1 Key Screens (Wireframe Descriptions)
-#### Dashboard (Post-Login Landing)
-{self._bullets(features[:1])}
-#### Project Timeline View
-{self._bullets(features[1:2] or features[:1])}
-#### Decision Detail View
-{self._bullets(features[2:3] or features[:1])}
-#### Search Results View
-{self._bullets(features[3:4] or features[:1])}
-#### Create/Edit Decision Form
-{self._bullets(features[4:5] or features[:1])}
-#### Admin Settings
-{self._bullets(features[5:6] or features[:1])}
-#### Billing Page
-{self._bullets(features[6:7] or features[:1])}
+    md += "### 7.2 Epic 2: Decision Retrieval\n"
+    for sid in ["US-2.1", "US-2.2", "US-2.3"]:
+        us = stories[sid]
+        md += f"#### {sid}\n{us.description}\nAcceptance Criteria:\n{_bullets(us.acceptance_criteria)}\n"
 
-### 9.2 Design Principles
-{self._bullets(features[:4])}
+    md += "### 7.3 Epic 3: Decision Management\n"
+    for sid in ["US-3.1", "US-3.2", "US-3.3"]:
+        us = stories[sid]
+        md += f"#### {sid}\n{us.description}\nAcceptance Criteria:\n{_bullets(us.acceptance_criteria)}\n"
 
-## 10. Dependencies and Integrations
-### 10.1 External Dependencies
-{self._bullets(tech[:5])}
+    md += "### 7.4 Epic 4: Multi-Tenant Administration\n"
+    for sid in ["US-4.1", "US-4.2", "US-4.3"]:
+        us = stories[sid]
+        md += f"#### {sid}\n{us.description}\nAcceptance Criteria:\n{_bullets(us.acceptance_criteria)}\n"
 
-### 10.2 API Rate Limits and Handling
-{self._bullets(deploy[:3])}
+    md += "## 8. Technical Architecture\n"
+    md += f"### 8.1 System Architecture Overview\n{prd.architecture_summary}\n\n"
 
-### 10.3 Fallback Strategies
-{self._bullets(deploy[3:6] or deploy)}
+    md += "### 8.2 Data Model (Core Entities)\n"
+    md += f"#### Tenant (Organization)\n{prd.data_model_summary}\n"
+    md += f"#### User\n{prd.data_model_summary}\n"
+    md += f"#### Project\n{prd.data_model_summary}\n"
+    md += f"#### Decision (Core Entity)\n{prd.data_model_summary}\n"
+    md += f"#### Decision Relationship\n{prd.data_model_summary}\n"
+    md += f"#### Integration (Slack)\n{prd.data_model_summary}\n"
 
-## 11. Non-Functional Requirements
-### 11.1 Performance
-{self._bullets(nfr[:3])}
+    md += "### 8.3 API Endpoints (Key Routes)\n"
+    for group in ["Authentication", "Organizations", "Projects", "Decisions", "Search", "Integrations", "Billing"]:
+        md += f"#### {group}\n{prd.api_summary}\n"
 
-### 11.2 Scalability
-{self._bullets(scalability)}
+    md += "### 8.4 Slack Integration Architecture\n"
+    md += f"#### OAuth Flow\n{prd.slack_integration_summary}\n"
+    md += f"#### Event Subscription Flow\n{prd.slack_integration_summary}\n"
+    md += f"#### Slack Bot Permissions Required\n{prd.slack_integration_summary}\n"
+    md += f"#### Data Privacy\n{prd.slack_integration_summary}\n"
 
-### 11.3 Reliability
-{self._bullets(nfr[3:5] or nfr)}
+    md += "### 8.5 Security and Compliance\n"
+    md += f"#### Data Security\n{prd.security_summary}\n"
+    md += f"#### Authentication\n{prd.security_summary}\n"
+    md += f"#### Access Control\n{prd.security_summary}\n"
+    md += f"#### Compliance Considerations (Future)\n{prd.security_summary}\n\n"
 
-### 11.4 Security
-{self._bullets(sec[:3])}
+    md += "## 9. User Interface Design\n"
+    md += "### 9.1 Key Screens (Wireframe Descriptions)\n"
+    for screen in [
+        "Dashboard (Post-Login Landing)",
+        "Project Timeline View",
+        "Decision Detail View",
+        "Search Results View",
+        "Create/Edit Decision Form",
+        "Admin Settings",
+        "Billing Page",
+    ]:
+        md += f"#### {screen}\n{prd.ui_summary}\n"
+    md += f"### 9.2 Design Principles\n{prd.ui_summary}\n\n"
 
-### 11.5 Compliance
-{self._bullets(sec[3:6] or sec)}
+    md += "## 10. Dependencies and Integrations\n"
+    md += f"### 10.1 External Dependencies\n{prd.dependencies_summary}\n"
+    md += f"### 10.2 API Rate Limits and Handling\n{prd.dependencies_summary}\n"
+    md += f"### 10.3 Fallback Strategies\n{prd.dependencies_summary}\n\n"
 
-## 12. Testing Strategy
-### 12.1 Test Coverage Goals
-{self._metrics_table(metrics)}
+    md += "## 11. Non-Functional Requirements\n"
+    md += f"### 11.1 Performance\n{prd.non_functional_summary}\n"
+    md += f"### 11.2 Scalability\n{prd.non_functional_summary}\n"
+    md += f"### 11.3 Reliability\n{prd.non_functional_summary}\n"
+    md += f"### 11.4 Security\n{prd.non_functional_summary}\n"
+    md += f"### 11.5 Compliance\n{prd.non_functional_summary}\n\n"
 
-### 12.2 Key Test Scenarios
-#### Decision Capture
-{self._bullets(features[:2])}
-#### Search and Retrieval
-{self._bullets(features[2:4] or features[:2])}
-#### Multi-Tenancy
-{self._bullets(arch[:2])}
-#### Billing
-{self._bullets(constraints[:2])}
-#### Performance
-{self._bullets(nfr[:2])}
+    md += "## 12. Testing Strategy\n"
+    md += f"### 12.1 Test Coverage Goals\n{prd.testing_summary}\n"
+    md += "### 12.2 Key Test Scenarios\n"
+    for scenario in ["Decision Capture", "Search and Retrieval", "Multi-Tenancy", "Billing", "Performance"]:
+        md += f"#### {scenario}\n{prd.testing_summary}\n"
 
-## 13. Launch Plan
-### 13.1 Pre-Launch (Weeks -4 to -1)
-{self._bullets(deploy[:3])}
+    md += "## 13. Launch Plan\n"
+    md += f"### 13.1 Pre-Launch (Weeks -4 to -1)\n{prd.launch_plan_summary}\n"
+    md += f"### 13.2 Launch (Week 0)\n{prd.launch_plan_summary}\n"
+    md += f"### 13.3 Post-Launch Monitoring\n{prd.launch_plan_summary}\n\n"
 
-### 13.2 Launch (Week 0)
-{self._bullets(deploy[3:6] or deploy)}
+    md += "## 14. Open Questions and Assumptions\n"
+    md += f"### 14.1 Open Questions\n{_bullets(prd.open_questions)}\n"
+    md += f"### 14.2 Assumptions\n{_bullets(prd.assumptions)}\n"
+    md += f"### 14.3 Risks and Mitigations\n{_bullets(prd.risks)}\n\n"
 
-### 13.3 Post-Launch Monitoring
-{self._bullets(metrics)}
+    md += "## 15. Success Criteria and Definition of Done\n"
+    md += f"### 15.1 Stage 1 is \"Done\" When\n{_bullets(prd.definition_of_done)}\n"
+    md += f"### 15.2 Stage 1 is \"Successful\" When (6-Month Post-Launch)\n{_bullets(prd.leading_indicators)}\n\n"
 
-## 14. Open Questions and Assumptions
-### 14.1 Open Questions
-- Which assumptions require stakeholder confirmation before implementation?
-- Which dependencies are highest risk for schedule variance?
+    md += "## 16. Appendix\n"
+    md += f"### 16.1 Glossary\n{_bullets(prd.glossary)}\n"
+    md += "### 16.2 References\n"
+    md += "- [1] User-provided project context from requirement intake.\n"
+    md += "- [2] Product constraints and notes supplied in the generation payload.\n\n"
 
-### 14.2 Assumptions
-- Assumptions are derived only from provided input context.
-- Missing details are marked as insufficient information.
+    md += "## 17. Document Change Log\n"
+    md += "| Version | Date | Author | Changes |\n"
+    md += "|---------|------|--------|---------|\n"
+    md += f"| 1.0 | {today} | Product Team | Initial generated PRD draft |\n"
 
-### 14.3 Risks and Mitigations
-{self._risk_table(risks)}
+    return md
 
-## 15. Success Criteria and Definition of Done
-### 15.1 Stage 1 is "Done" When
-{self._bullets(dod)}
 
-### 15.2 Stage 1 is "Successful" When (6-Month Post-Launch)
-{self._bullets(metrics)}
+def _validate_markdown_structure(md: str, prd: PRDContent) -> tuple[list[str], bool]:
+    errors: list[str] = []
 
-## 16. Appendix
-### 16.1 Glossary
-- Decision Record: structured, evidence-linked record of a team decision.
-- Evidence Link: original source artifact URL (message/thread/document).
-- Tenant: organization-level isolated workspace.
+    expected_counts = Counter(REQUIRED_SECTION_HEADINGS)
+    for heading, expected_count in expected_counts.items():
+        actual_count = _count_heading_lines(md, heading)
+        if actual_count == 0:
+            errors.append(f"MISSING:{heading}")
+        elif actual_count > expected_count:
+            errors.append(f"DUPLICATE:{heading}")
 
-### 16.2 References
-- [1] User-provided requirement context and structured inputs.
-- [2] DecisionVault internal product notes supplied in this session.
+    for marker in EXPECTED_NUMBER_PATHS:
+        if not re.search(rf"\b{re.escape(marker)}", md):
+            errors.append(f"NUMBER_MISSING:{marker}")
 
-## 17. Document Change Log
-| Version | Date | Author | Changes |
-|---------|------|--------|---------|
-| 1.0 | {today} | Product Team | Initial generated PRD draft |
-"""
+    if re.search(r"\{\s*\"[A-Za-z0-9_]+\"\s*:", md):
+        errors.append("JSON_ARTIFACT_DETECTED")
 
-        missing = [h for h in REQUIRED_SECTION_HEADINGS if h not in markdown]
-        if missing:
-            raise ValueError(f"Missing required sections: {missing}")
+    in_scope = {x.strip().lower() for x in prd.in_scope_features if isinstance(x, str) and x.strip()}
+    out_scope = {x.strip().lower() for x in prd.out_of_scope if isinstance(x, str) and x.strip()}
+    overlap = in_scope & out_scope
+    if overlap:
+        errors.append("OUT_OF_SCOPE_LEAK_IN_SCOPE")
 
-        self.sections_generated = REQUIRED_SECTION_HEADINGS.copy()
-        return markdown
+    return errors, len(errors) == 0
 
 
 async def generate_multistep_prd(
     payload: PRDGenerateRequest,
     tenant_id: str,
     progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
+    control_cb: Callable[[], Awaitable[dict[str, bool]] | dict[str, bool] | None] | None = None,
 ) -> PRDMultiStepResponse:
-    orchestrator = PRDOrchestrator(tenant_id=tenant_id, progress_cb=progress_cb)
+    orchestrator = PRDOrchestrator(tenant_id=tenant_id, progress_cb=progress_cb, control_cb=control_cb)
 
     shared_payload = {
         "title": payload.title,
@@ -1192,25 +1109,18 @@ async def generate_multistep_prd(
         "additional_notes": payload.additional_notes or "",
     }
 
-    core = await orchestrator.generate_core_sections(shared_payload)
-    feature = await orchestrator.generate_feature_sections(shared_payload)
-    architecture = await orchestrator.generate_architecture_sections(shared_payload)
-    nonfunctional = await orchestrator.generate_nonfunctional_sections(shared_payload)
-    risk = await orchestrator.generate_risk_sections(shared_payload)
+    prd_content = await orchestrator.generate_content(shared_payload)
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    markdown = render_hierarchical_prd(prd_content, today)
 
-    markdown = orchestrator.merge_markdown(
-        core,
-        feature,
-        architecture,
-        nonfunctional,
-        risk,
-        project_title=payload.title,
-    )
+    missing_sections, has_all_required_sections = _validate_markdown_structure(markdown, prd_content)
+    if not has_all_required_sections:
+        raise ValueError(f"Missing required sections: {missing_sections}")
 
     return PRDMultiStepResponse(
         status="success",
         pages_estimated=5,
-        sections_generated=orchestrator.sections_generated,
+        sections_generated=REQUIRED_SECTION_HEADINGS,
         total_tokens_used=orchestrator.total_tokens_used,
         prd_markdown=markdown,
         required_sections=REQUIRED_SECTION_HEADINGS,
