@@ -18,6 +18,7 @@ from app.schemas.requirements import (
 from app.services.requirements_service import generate_prd, respond_intake, start_intake, undo_intake, redo_intake
 from app.services.prd_service import generate_prd as generate_prd_text, save_prd
 from app.services.schema_flow_service import generate_schema_flow
+from app.services.usecase_flow_service import generate_usecase_flow
 from app.services.system_design_service import generate_system_design
 
 
@@ -25,6 +26,7 @@ router = APIRouter(prefix="/api/requirements", tags=["requirements"])
 logger = logging.getLogger("decisionvault.requirements.sdd")
 _ACTIVE_SDD_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
 _ACTIVE_SCHEMA_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
+_ACTIVE_USECASE_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
 
 
 def _utcnow() -> datetime:
@@ -139,11 +141,38 @@ async def _run_sdd_job(
         {"$set": {"status": "running", "started_at": started_at, "updated_at": started_at}},
     )
     try:
+        async def _progress_handler(ev: dict) -> None:
+            await _append_sdd_run_event(run_id, ev)
+            while True:
+                run_doc = await db.sdd_runs.find_one({"_id": run_id}, {"pause_requested": 1, "stop_requested": 1})
+                if not run_doc:
+                    return
+                if run_doc.get("stop_requested"):
+                    raise asyncio.CancelledError("Run stopped by user.")
+                if run_doc.get("pause_requested"):
+                    await db.sdd_runs.update_one(
+                        {"_id": run_id},
+                        {"$set": {"status": "paused", "updated_at": _utcnow()}},
+                    )
+                    await asyncio.sleep(1)
+                    continue
+                break
+            await db.sdd_runs.update_one(
+                {"_id": run_id},
+                {"$set": {"status": "running", "updated_at": _utcnow()}},
+            )
+
         content = await generate_system_design(
             structured,
             tenant_id,
-            progress_cb=lambda ev: _append_sdd_run_event(run_id, ev),
+            project_id=project_id,
+            intake_id=intake_id,
+            run_id=str(run_id),
+            progress_cb=_progress_handler,
         )
+        run_doc = await db.sdd_runs.find_one({"_id": run_id}, {"stop_requested": 1})
+        if run_doc and run_doc.get("stop_requested"):
+            raise asyncio.CancelledError("Run stopped by user.")
         saved = await _save_system_design(intake_id, project_id, tenant_id, content)
         completed_at = _utcnow()
         await db.sdd_runs.update_one(
@@ -158,6 +187,19 @@ async def _run_sdd_job(
                         "version": saved.get("version"),
                         "generated_at": saved.get("generated_at"),
                     },
+                }
+            },
+        )
+    except asyncio.CancelledError:
+        stopped_at = _utcnow()
+        await db.sdd_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "stopped",
+                    "completed_at": stopped_at,
+                    "updated_at": stopped_at,
+                    "error": "Run stopped by user.",
                 }
             },
         )
@@ -185,26 +227,54 @@ async def _save_schema_flow(
     tenant_id: str,
     project_id: str,
     result: dict,
-) -> None:
+) -> dict:
     db = get_db()
+    intake_oid = ObjectId(intake_id)
+    tenant_oid = ObjectId(tenant_id)
+    project_oid = ObjectId(project_id)
+    last = await db.schema_flow_documents.find_one(
+        {
+            "intake_id": intake_oid,
+            "tenant_id": tenant_oid,
+            "project_id": project_oid,
+        },
+        sort=[("version", -1)],
+    )
+    next_version = (last.get("version") if last else 0) + 1
+    now = _utcnow()
     doc = {
-        "intake_id": ObjectId(intake_id),
-        "tenant_id": ObjectId(tenant_id),
-        "project_id": ObjectId(project_id),
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
         "nodes": result.get("nodes") or [],
         "edges": result.get("edges") or [],
         "summary": result.get("summary") or "",
-        "updated_at": _utcnow(),
+        "updated_at": now,
+    }
+    await db.schema_flow_documents.insert_one(doc)
+    latest_doc = {
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
+        "nodes": doc["nodes"],
+        "edges": doc["edges"],
+        "summary": doc["summary"],
+        "updated_at": now,
     }
     await db.schema_flows.update_one(
         {
-            "intake_id": ObjectId(intake_id),
-            "tenant_id": ObjectId(tenant_id),
-            "project_id": ObjectId(project_id),
+            "intake_id": intake_oid,
+            "tenant_id": tenant_oid,
+            "project_id": project_oid,
         },
-        {"$set": doc, "$setOnInsert": {"created_at": _utcnow()}},
+        {"$set": latest_doc, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
+    return doc
 
 
 async def _get_latest_sdd_content(*, tenant_id: str, project_id: str) -> str:
@@ -217,6 +287,187 @@ async def _get_latest_sdd_content(*, tenant_id: str, project_id: str) -> str:
         sort=[("generated_at", -1)],
     )
     return str(doc.get("content") or "") if doc else ""
+
+
+async def _save_usecase_flow(
+    *,
+    intake_id: str,
+    tenant_id: str,
+    project_id: str,
+    result: dict,
+) -> dict:
+    db = get_db()
+    intake_oid = ObjectId(intake_id)
+    tenant_oid = ObjectId(tenant_id)
+    project_oid = ObjectId(project_id)
+    last = await db.usecase_flow_documents.find_one(
+        {
+            "intake_id": intake_oid,
+            "tenant_id": tenant_oid,
+            "project_id": project_oid,
+        },
+        sort=[("version", -1)],
+    )
+    next_version = (last.get("version") if last else 0) + 1
+    now = _utcnow()
+    doc = {
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
+        "nodes": result.get("nodes") or [],
+        "edges": result.get("edges") or [],
+        "summary": result.get("summary") or "",
+        "updated_at": now,
+    }
+    await db.usecase_flow_documents.insert_one(doc)
+    await db.usecase_flows.update_one(
+        {"intake_id": intake_oid, "tenant_id": tenant_oid, "project_id": project_oid},
+        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return doc
+
+
+async def _run_usecase_flow_job(
+    *,
+    run_id: ObjectId,
+    intake_id: str,
+    project_id: str,
+    tenant_id: str,
+    structured: dict,
+    user_request: str,
+    current_nodes: list,
+    current_edges: list,
+    latest_sdd_content: str,
+) -> None:
+    db = get_db()
+    started_at = _utcnow()
+    await db.usecase_flow_runs.update_one(
+        {"_id": run_id},
+        {
+            "$set": {
+                "status": "running",
+                "started_at": started_at,
+                "updated_at": started_at,
+                "steps": [{"stage": "usecase_generation", "status": "running", "started_at": started_at}],
+            }
+        },
+    )
+    try:
+        while True:
+            run_doc = await db.usecase_flow_runs.find_one({"_id": run_id}, {"pause_requested": 1, "stop_requested": 1})
+            if not run_doc:
+                break
+            if run_doc.get("stop_requested"):
+                raise asyncio.CancelledError("Run stopped by user.")
+            if run_doc.get("pause_requested"):
+                await db.usecase_flow_runs.update_one(
+                    {"_id": run_id},
+                    {"$set": {"status": "paused", "updated_at": _utcnow()}},
+                )
+                await asyncio.sleep(1)
+                continue
+            break
+        await db.usecase_flow_runs.update_one({"_id": run_id}, {"$set": {"status": "running", "updated_at": _utcnow()}})
+
+        result = await generate_usecase_flow(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            intake_id=intake_id,
+            structured=structured,
+            current_nodes=current_nodes,
+            current_edges=current_edges,
+            user_request=user_request,
+            latest_sdd_content=latest_sdd_content,
+            run_id=str(run_id),
+        )
+        run_doc = await db.usecase_flow_runs.find_one({"_id": run_id}, {"stop_requested": 1})
+        if run_doc and run_doc.get("stop_requested"):
+            raise asyncio.CancelledError("Run stopped by user.")
+
+        saved = await _save_usecase_flow(
+            intake_id=intake_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            result=result,
+        )
+        completed_at = _utcnow()
+        await db.usecase_flow_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": completed_at,
+                    "updated_at": completed_at,
+                    "error": None,
+                    "result": {
+                        **result,
+                        "version": saved.get("version"),
+                        "generated_at": saved.get("generated_at"),
+                    },
+                    "steps": [
+                        {
+                            "stage": "usecase_generation",
+                            "status": "completed",
+                            "started_at": started_at,
+                            "completed_at": completed_at,
+                            "duration_seconds": round((completed_at - started_at).total_seconds(), 3),
+                        }
+                    ],
+                }
+            },
+        )
+    except asyncio.CancelledError:
+        stopped_at = _utcnow()
+        await db.usecase_flow_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "stopped",
+                    "completed_at": stopped_at,
+                    "updated_at": stopped_at,
+                    "error": "Run stopped by user.",
+                    "steps": [
+                        {
+                            "stage": "usecase_generation",
+                            "status": "stopped",
+                            "started_at": started_at,
+                            "completed_at": stopped_at,
+                            "duration_seconds": round((stopped_at - started_at).total_seconds(), 3),
+                            "error": "Run stopped by user.",
+                        }
+                    ],
+                }
+            },
+        )
+    except Exception as exc:
+        logger.exception("usecase_flow_run_failed run_id=%s project_id=%s", str(run_id), project_id)
+        failed_at = _utcnow()
+        await db.usecase_flow_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "completed_at": failed_at,
+                    "updated_at": failed_at,
+                    "error": str(exc),
+                    "steps": [
+                        {
+                            "stage": "usecase_generation",
+                            "status": "failed",
+                            "started_at": started_at,
+                            "completed_at": failed_at,
+                            "duration_seconds": round((failed_at - started_at).total_seconds(), 3),
+                            "error": str(exc),
+                        }
+                    ],
+                }
+            },
+        )
+    finally:
+        _ACTIVE_USECASE_TASKS_BY_RUN_ID.pop(str(run_id), None)
 
 
 async def _run_schema_flow_job(
@@ -245,15 +496,40 @@ async def _run_schema_flow_job(
         },
     )
     try:
+        while True:
+            run_doc = await db.schema_flow_runs.find_one({"_id": run_id}, {"pause_requested": 1, "stop_requested": 1})
+            if not run_doc:
+                break
+            if run_doc.get("stop_requested"):
+                raise asyncio.CancelledError("Run stopped by user.")
+            if run_doc.get("pause_requested"):
+                await db.schema_flow_runs.update_one(
+                    {"_id": run_id},
+                    {"$set": {"status": "paused", "updated_at": _utcnow()}},
+                )
+                await asyncio.sleep(1)
+                continue
+            break
+        await db.schema_flow_runs.update_one(
+            {"_id": run_id},
+            {"$set": {"status": "running", "updated_at": _utcnow()}},
+        )
+
         result = await generate_schema_flow(
             tenant_id=tenant_id,
+            project_id=project_id,
+            intake_id=intake_id,
             structured=structured,
             current_nodes=current_nodes,
             current_edges=current_edges,
             user_request=user_request,
             latest_sdd_content=latest_sdd_content,
+            run_id=str(run_id),
         )
-        await _save_schema_flow(
+        run_doc = await db.schema_flow_runs.find_one({"_id": run_id}, {"stop_requested": 1})
+        if run_doc and run_doc.get("stop_requested"):
+            raise asyncio.CancelledError("Run stopped by user.")
+        saved = await _save_schema_flow(
             intake_id=intake_id,
             tenant_id=tenant_id,
             project_id=project_id,
@@ -268,7 +544,11 @@ async def _run_schema_flow_job(
                     "completed_at": completed_at,
                     "updated_at": completed_at,
                     "error": None,
-                    "result": result,
+                    "result": {
+                        **result,
+                        "version": saved.get("version"),
+                        "generated_at": saved.get("generated_at"),
+                    },
                     "steps": [
                         {
                             "stage": "schema_generation",
@@ -276,6 +556,29 @@ async def _run_schema_flow_job(
                             "started_at": started_at,
                             "completed_at": completed_at,
                             "duration_seconds": round((completed_at - started_at).total_seconds(), 3),
+                        }
+                    ],
+                }
+            },
+        )
+    except asyncio.CancelledError:
+        stopped_at = _utcnow()
+        await db.schema_flow_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "stopped",
+                    "completed_at": stopped_at,
+                    "updated_at": stopped_at,
+                    "error": "Run stopped by user.",
+                    "steps": [
+                        {
+                            "stage": "schema_generation",
+                            "status": "stopped",
+                            "started_at": started_at,
+                            "completed_at": stopped_at,
+                            "duration_seconds": round((stopped_at - started_at).total_seconds(), 3),
+                            "error": "Run stopped by user.",
                         }
                     ],
                 }
@@ -383,7 +686,12 @@ async def generate_full_prd(
         content = generate_prd_text(structured)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    saved = await save_prd(intake_id, content)
+    saved = await save_prd(
+        intake_id,
+        content,
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+    )
     return {"content": content, "version": saved["version"]}
 
 
@@ -411,7 +719,13 @@ async def generate_system_design_doc(
             },
         )
     structured = intake.get("structured") or {}
-    content = await generate_system_design(structured, _user.get("tenant_id"))
+    content = await generate_system_design(
+        structured,
+        _user.get("tenant_id"),
+        project_id=project_id,
+        intake_id=intake_id,
+        run_id=None,
+    )
     saved = await _save_system_design(intake_id, project_id, _user.get("tenant_id"), content)
     return {"content": content, "version": saved["version"]}
 
@@ -450,6 +764,8 @@ async def generate_system_design_run(
             "project_id": ObjectId(project_id),
             "intake_id": ObjectId(intake_id),
             "status": "queued",
+            "pause_requested": False,
+            "stop_requested": False,
             "steps": [],
             "error": None,
             "result": None,
@@ -509,6 +825,94 @@ async def get_system_design_run_status(
         "started_at": doc.get("started_at"),
         "completed_at": doc.get("completed_at"),
     }
+
+
+@router.post("/system-design/runs/{run_id}/pause")
+async def pause_system_design_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.sdd_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="SDD run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.sdd_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": True, "status": "paused", "updated_at": _utcnow()}},
+    )
+    await _append_sdd_run_event(oid, {"stage": "run", "status": "paused"})
+    return {"run_id": run_id, "status": "paused"}
+
+
+@router.post("/system-design/runs/{run_id}/resume")
+async def resume_system_design_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.sdd_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="SDD run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.sdd_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": False, "status": "running", "updated_at": _utcnow()}},
+    )
+    await _append_sdd_run_event(oid, {"stage": "run", "status": "running"})
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.post("/system-design/runs/{run_id}/stop")
+async def stop_system_design_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.sdd_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="SDD run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    now = _utcnow()
+    await db.sdd_runs.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "stop_requested": True,
+                "pause_requested": False,
+                "status": "stopped",
+                "completed_at": now,
+                "updated_at": now,
+                "error": "Run stopped by user.",
+            }
+        },
+    )
+    task = _ACTIVE_SDD_TASKS_BY_RUN_ID.get(run_id)
+    if task and not task.done():
+        task.cancel()
+    await _append_sdd_run_event(oid, {"stage": "run", "status": "stopped", "error": "Run stopped by user."})
+    return {"run_id": run_id, "status": "stopped"}
 
 
 @router.get("/{intake_id}/system-design")
@@ -697,14 +1101,76 @@ async def get_requirements_status(
 async def get_prd(
     intake_id: str,
     project_id: str | None = None,
-    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id query parameter is required")
     db = get_db()
-    doc = await db.prd_documents.find_one({"intake_id": ObjectId(intake_id)}, sort=[("version", -1)])
+    doc = await db.prd_documents.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        },
+        sort=[("version", -1)],
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="PRD not found")
+    return {
+        "content": doc.get("content"),
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+    }
+
+
+@router.get("/{intake_id}/prd/versions")
+async def get_prd_versions(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    docs = await db.prd_documents.find(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        },
+        {"version": 1, "generated_at": 1},
+    ).sort("version", -1).to_list(length=200)
+    return {
+        "items": [
+            {
+                "version_number": d.get("version"),
+                "generated_at": d.get("generated_at"),
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.get("/{intake_id}/prd/versions/{version_number}")
+async def get_prd_version(
+    intake_id: str,
+    version_number: int,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.prd_documents.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+            "version": version_number,
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="PRD version not found")
     return {
         "content": doc.get("content"),
         "version": doc.get("version"),
@@ -738,34 +1204,29 @@ async def generate_schema_flow_doc(
     try:
         result = await generate_schema_flow(
             tenant_id=user.get("tenant_id"),
+            project_id=project_id,
+            intake_id=intake_id,
             structured=structured,
             current_nodes=current_nodes,
             current_edges=current_edges,
             user_request=user_request,
             latest_sdd_content=latest_sdd_content,
+            run_id=None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    doc = {
-        "intake_id": ObjectId(intake_id),
-        "tenant_id": ObjectId(user.get("tenant_id")),
-        "project_id": ObjectId(project_id),
-        "nodes": result.get("nodes") or [],
-        "edges": result.get("edges") or [],
-        "summary": result.get("summary") or "",
-        "updated_at": _utcnow(),
-    }
-    await db.schema_flows.update_one(
-        {
-            "intake_id": ObjectId(intake_id),
-            "tenant_id": ObjectId(user.get("tenant_id")),
-            "project_id": ObjectId(project_id),
-        },
-        {"$set": doc, "$setOnInsert": {"created_at": _utcnow()}},
-        upsert=True,
+    saved = await _save_schema_flow(
+        intake_id=intake_id,
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        result=result,
     )
-    return result
+    return {
+        **result,
+        "version": saved.get("version"),
+        "generated_at": saved.get("generated_at"),
+    }
 
 
 @router.post("/{intake_id}/generate-schema-flow/run")
@@ -802,6 +1263,8 @@ async def generate_schema_flow_run(
             "project_id": ObjectId(project_id),
             "intake_id": ObjectId(intake_id),
             "status": "queued",
+            "pause_requested": False,
+            "stop_requested": False,
             "steps": [],
             "error": None,
             "result": None,
@@ -870,6 +1333,91 @@ async def get_schema_flow_run_status(
     }
 
 
+@router.post("/schema-flow/runs/{run_id}/pause")
+async def pause_schema_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.schema_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Schema flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.schema_flow_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": True, "status": "paused", "updated_at": _utcnow()}},
+    )
+    return {"run_id": run_id, "status": "paused"}
+
+
+@router.post("/schema-flow/runs/{run_id}/resume")
+async def resume_schema_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.schema_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Schema flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.schema_flow_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": False, "status": "running", "updated_at": _utcnow()}},
+    )
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.post("/schema-flow/runs/{run_id}/stop")
+async def stop_schema_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.schema_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Schema flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    now = _utcnow()
+    await db.schema_flow_runs.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "stop_requested": True,
+                "pause_requested": False,
+                "status": "stopped",
+                "completed_at": now,
+                "updated_at": now,
+                "error": "Run stopped by user.",
+            }
+        },
+    )
+    task = _ACTIVE_SCHEMA_TASKS_BY_RUN_ID.get(run_id)
+    if task and not task.done():
+        task.cancel()
+    return {"run_id": run_id, "status": "stopped"}
+
+
 @router.get("/{intake_id}/schema-flow")
 async def get_schema_flow_doc(
     intake_id: str,
@@ -898,6 +1446,393 @@ async def get_schema_flow_doc(
         "nodes": doc.get("nodes") or [],
         "edges": doc.get("edges") or [],
         "summary": doc.get("summary") or "",
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+        "updated_at": doc.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.get("/{intake_id}/schema-flow/versions")
+async def get_schema_flow_versions(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    docs = await db.schema_flow_documents.find(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        },
+        {"version": 1, "generated_at": 1, "updated_at": 1},
+    ).sort("version", -1).to_list(length=200)
+    return {
+        "items": [
+            {
+                "version_number": d.get("version"),
+                "generated_at": d.get("generated_at"),
+                "updated_at": d.get("updated_at"),
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.get("/{intake_id}/schema-flow/versions/{version_number}")
+async def get_schema_flow_version(
+    intake_id: str,
+    version_number: int,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.schema_flow_documents.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+            "version": version_number,
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Schema flow version not found")
+    return {
+        "nodes": doc.get("nodes") or [],
+        "edges": doc.get("edges") or [],
+        "summary": doc.get("summary") or "",
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+        "updated_at": doc.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.post("/{intake_id}/generate-usecase-flow")
+async def generate_usecase_flow_doc(
+    intake_id: str,
+    payload: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    intake = await db.requirements_intakes.find_one({"_id": ObjectId(intake_id)})
+    if not intake:
+        raise HTTPException(status_code=404, detail="Intake not found")
+    structured = intake.get("structured") or {}
+    user_request = str(payload.get("request") or "").strip()
+    if not user_request:
+        raise HTTPException(status_code=400, detail="request is required")
+    current_nodes = payload.get("nodes") or []
+    current_edges = payload.get("edges") or []
+    latest_sdd_content = await _get_latest_sdd_content(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+    )
+    try:
+        result = await generate_usecase_flow(
+            tenant_id=user.get("tenant_id"),
+            project_id=project_id,
+            intake_id=intake_id,
+            structured=structured,
+            current_nodes=current_nodes,
+            current_edges=current_edges,
+            user_request=user_request,
+            latest_sdd_content=latest_sdd_content,
+            run_id=None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    saved = await _save_usecase_flow(
+        intake_id=intake_id,
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        result=result,
+    )
+    return {
+        **result,
+        "version": saved.get("version"),
+        "generated_at": saved.get("generated_at"),
+    }
+
+
+@router.post("/{intake_id}/generate-usecase-flow/run")
+async def generate_usecase_flow_run(
+    intake_id: str,
+    payload: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    intake = await db.requirements_intakes.find_one({"_id": ObjectId(intake_id)})
+    if not intake:
+        raise HTTPException(status_code=404, detail="Intake not found")
+
+    structured = intake.get("structured") or {}
+    user_request = str(payload.get("request") or "").strip()
+    if not user_request:
+        user_request = "Generate initial use case interaction diagram from requirements and architecture inputs."
+    current_nodes = payload.get("nodes") or []
+    current_edges = payload.get("edges") or []
+    latest_sdd_content = await _get_latest_sdd_content(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+    )
+
+    run_id = ObjectId()
+    created_at = _utcnow()
+    await db.usecase_flow_runs.insert_one(
+        {
+            "_id": run_id,
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+            "intake_id": ObjectId(intake_id),
+            "status": "queued",
+            "pause_requested": False,
+            "stop_requested": False,
+            "steps": [],
+            "error": None,
+            "result": None,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": None,
+            "completed_at": None,
+            "request": user_request,
+        }
+    )
+    task = asyncio.create_task(
+        _run_usecase_flow_job(
+            run_id=run_id,
+            intake_id=intake_id,
+            project_id=project_id,
+            tenant_id=user.get("tenant_id"),
+            structured=structured,
+            user_request=user_request,
+            current_nodes=current_nodes,
+            current_edges=current_edges,
+            latest_sdd_content=latest_sdd_content,
+        )
+    )
+    _ACTIVE_USECASE_TASKS_BY_RUN_ID[str(run_id)] = task
+    return {"run_id": str(run_id), "status": "queued"}
+
+
+@router.get("/usecase-flow/runs/{run_id}")
+async def get_usecase_flow_run_status(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.usecase_flow_runs.find_one(
+        {
+            "_id": oid,
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Usecase flow run not found")
+    total_elapsed = None
+    started_at = _coerce_utc_datetime(doc.get("started_at"))
+    if started_at:
+        end_time = _coerce_utc_datetime(doc.get("completed_at")) or _utcnow()
+        total_elapsed = round((end_time - started_at).total_seconds(), 3)
+    return {
+        "run_id": str(doc.get("_id")),
+        "status": doc.get("status"),
+        "steps": doc.get("steps") or [],
+        "error": doc.get("error"),
+        "result": doc.get("result"),
+        "timing": {"total_elapsed_seconds": total_elapsed},
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+        "started_at": doc.get("started_at"),
+        "completed_at": doc.get("completed_at"),
+    }
+
+
+@router.post("/usecase-flow/runs/{run_id}/pause")
+async def pause_usecase_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.usecase_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Usecase flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.usecase_flow_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": True, "status": "paused", "updated_at": _utcnow()}},
+    )
+    return {"run_id": run_id, "status": "paused"}
+
+
+@router.post("/usecase-flow/runs/{run_id}/resume")
+async def resume_usecase_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.usecase_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Usecase flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.usecase_flow_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": False, "status": "running", "updated_at": _utcnow()}},
+    )
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.post("/usecase-flow/runs/{run_id}/stop")
+async def stop_usecase_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.usecase_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Usecase flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    now = _utcnow()
+    await db.usecase_flow_runs.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "stop_requested": True,
+                "pause_requested": False,
+                "status": "stopped",
+                "completed_at": now,
+                "updated_at": now,
+                "error": "Run stopped by user.",
+            }
+        },
+    )
+    task = _ACTIVE_USECASE_TASKS_BY_RUN_ID.get(run_id)
+    if task and not task.done():
+        task.cancel()
+    return {"run_id": run_id, "status": "stopped"}
+
+
+@router.get("/{intake_id}/usecase-flow")
+async def get_usecase_flow_doc(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.usecase_flows.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        }
+    )
+    if not doc:
+        return {"nodes": [], "edges": [], "summary": "", "updated_at": None, "exists": False}
+    return {
+        "nodes": doc.get("nodes") or [],
+        "edges": doc.get("edges") or [],
+        "summary": doc.get("summary") or "",
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+        "updated_at": doc.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.get("/{intake_id}/usecase-flow/versions")
+async def get_usecase_flow_versions(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    docs = await db.usecase_flow_documents.find(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        },
+        {"version": 1, "generated_at": 1, "updated_at": 1},
+    ).sort("version", -1).to_list(length=200)
+    return {
+        "items": [
+            {
+                "version_number": d.get("version"),
+                "generated_at": d.get("generated_at"),
+                "updated_at": d.get("updated_at"),
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.get("/{intake_id}/usecase-flow/versions/{version_number}")
+async def get_usecase_flow_version(
+    intake_id: str,
+    version_number: int,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.usecase_flow_documents.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+            "version": version_number,
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Usecase flow version not found")
+    return {
+        "nodes": doc.get("nodes") or [],
+        "edges": doc.get("edges") or [],
+        "summary": doc.get("summary") or "",
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
         "updated_at": doc.get("updated_at"),
         "exists": True,
     }

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from app.db.mongo import get_db
 import re
@@ -224,18 +225,34 @@ Status: Draft for Development
     return content
 
 
-async def save_prd(intake_id: str, content: str) -> dict:
+async def save_prd(
+    intake_id: str,
+    content: str,
+    tenant_id: str | None = None,
+    project_id: str | None = None,
+) -> dict:
     db = get_db()
     intake_oid = ObjectId(intake_id)
-    last = await db.prd_documents.find_one(
-        {"intake_id": intake_oid}, sort=[("version", -1)]
-    )
-    next_version = (last.get("version") if last else 0) + 1
-    doc = {
+    base_doc = {
         "intake_id": intake_oid,
-        "version": next_version,
         "generated_at": _utcnow(),
         "content": content,
     }
-    await db.prd_documents.insert_one(doc)
-    return doc
+    if tenant_id:
+        base_doc["tenant_id"] = ObjectId(tenant_id)
+    if project_id:
+        base_doc["project_id"] = ObjectId(project_id)
+
+    # Unique index is (intake_id, version), so version must be allocated globally per intake.
+    # Retry on duplicate key to survive concurrent inserts.
+    for _ in range(3):
+        last = await db.prd_documents.find_one({"intake_id": intake_oid}, sort=[("version", -1)])
+        next_version = (last.get("version") if last else 0) + 1
+        doc = {**base_doc, "version": next_version}
+        try:
+            await db.prd_documents.insert_one(doc)
+            return doc
+        except DuplicateKeyError:
+            continue
+
+    raise RuntimeError("Failed to save PRD due to concurrent version conflict")

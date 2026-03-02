@@ -16,6 +16,11 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from app.core.config import settings
 from app.schemas.prd_generation import PRDGenerateRequest, PRDMultiStepResponse
 from app.services.llm_usage_service import log_llm_usage
+from app.services.project_vector_memory_service import (
+    retrieve_project_knowledge_chunks,
+    store_project_source_text,
+    sync_project_knowledge_chunks,
+)
 from app.services.token_limiter import TokenBudget, TokenLimiter
 
 logger = logging.getLogger("decisionvault.prd.multistep")
@@ -301,14 +306,21 @@ class PRDOrchestrator:
     def __init__(
         self,
         tenant_id: str,
+        project_id: str | None = None,
+        intake_id: str | None = None,
+        run_id: str | None = None,
         progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
         control_cb: Callable[[], Awaitable[dict[str, bool]] | dict[str, bool] | None] | None = None,
     ):
         self.tenant_id = tenant_id
+        self.project_id = project_id
+        self.intake_id = intake_id
+        self.run_id = run_id
         self.progress_cb = progress_cb
         self.control_cb = control_cb
         self.total_tokens_used = 0
         self.sections_generated: list[str] = []
+        self.retrieved_chunks: list[str] = []
         self.limiter = TokenLimiter(
             TokenBudget(max_input_tokens=MAX_STAGE_INPUT_TOKENS, max_output_tokens=MAX_STAGE_OUTPUT_TOKENS)
         )
@@ -737,6 +749,27 @@ class PRDOrchestrator:
         raise ValueError(f"{stage_name} failed: {last_error}")
 
     async def generate_content(self, payload: dict[str, Any]) -> PRDContent:
+        if self.project_id:
+            try:
+                await sync_project_knowledge_chunks(tenant_id=self.tenant_id, project_id=self.project_id)
+                retrieval_query = "\n".join(
+                    [
+                        f"title: {payload.get('title')}",
+                        f"problem_statement: {payload.get('problem_statement')}",
+                        "target_users: " + ", ".join(str(x) for x in (payload.get("target_users") or [])),
+                        "features: " + ", ".join(str(x) for x in (payload.get("features") or [])),
+                        f"additional_notes: {payload.get('additional_notes')}",
+                    ]
+                )
+                self.retrieved_chunks = await retrieve_project_knowledge_chunks(
+                    tenant_id=self.tenant_id,
+                    project_id=self.project_id,
+                    query_text=retrieval_query,
+                    top_k=6,
+                )
+            except Exception:
+                self.retrieved_chunks = []
+
         stage1 = await self._run_stage(
             stage_name="stage_1_core_context",
             schema=Stage1Output,
@@ -752,6 +785,7 @@ class PRDOrchestrator:
                 "target_users": payload["target_users"],
                 "features": payload["features"],
                 "additional_notes": payload.get("additional_notes", ""),
+                "retrieved_project_knowledge_chunks": self.retrieved_chunks,
             },
         )
 
@@ -769,6 +803,7 @@ class PRDOrchestrator:
                 "target_users": payload["target_users"],
                 "features": payload["features"],
                 "additional_notes": payload.get("additional_notes", ""),
+                "retrieved_project_knowledge_chunks": self.retrieved_chunks,
             },
         )
 
@@ -786,6 +821,7 @@ class PRDOrchestrator:
                 "target_users": payload["target_users"],
                 "features": payload["features"],
                 "additional_notes": payload.get("additional_notes", ""),
+                "retrieved_project_knowledge_chunks": self.retrieved_chunks,
             },
         )
 
@@ -803,6 +839,7 @@ class PRDOrchestrator:
                 "target_users": payload["target_users"],
                 "features": payload["features"],
                 "additional_notes": payload.get("additional_notes", ""),
+                "retrieved_project_knowledge_chunks": self.retrieved_chunks,
             },
         )
 
@@ -1096,10 +1133,20 @@ def _validate_markdown_structure(md: str, prd: PRDContent) -> tuple[list[str], b
 async def generate_multistep_prd(
     payload: PRDGenerateRequest,
     tenant_id: str,
+    project_id: str | None = None,
+    intake_id: str | None = None,
+    run_id: str | None = None,
     progress_cb: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     control_cb: Callable[[], Awaitable[dict[str, bool]] | dict[str, bool] | None] | None = None,
 ) -> PRDMultiStepResponse:
-    orchestrator = PRDOrchestrator(tenant_id=tenant_id, progress_cb=progress_cb, control_cb=control_cb)
+    orchestrator = PRDOrchestrator(
+        tenant_id=tenant_id,
+        project_id=project_id,
+        intake_id=intake_id,
+        run_id=run_id,
+        progress_cb=progress_cb,
+        control_cb=control_cb,
+    )
 
     shared_payload = {
         "title": payload.title,
@@ -1116,6 +1163,21 @@ async def generate_multistep_prd(
     missing_sections, has_all_required_sections = _validate_markdown_structure(markdown, prd_content)
     if not has_all_required_sections:
         raise ValueError(f"Missing required sections: {missing_sections}")
+
+    if project_id:
+        try:
+            source_id = f"{intake_id or 'unknown'}:{run_id or 'direct'}"
+            source_ver = int(datetime.now(timezone.utc).timestamp())
+            await store_project_source_text(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                source_type="prd",
+                source_id=source_id,
+                source_version=source_ver,
+                text=markdown,
+            )
+        except Exception:
+            pass
 
     return PRDMultiStepResponse(
         status="success",

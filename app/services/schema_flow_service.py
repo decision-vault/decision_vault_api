@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -10,6 +11,11 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.core.config import settings
 from app.services.llm_usage_service import log_llm_usage
+from app.services.project_vector_memory_service import (
+    retrieve_project_knowledge_chunks,
+    store_project_source_text,
+    sync_project_knowledge_chunks,
+)
 
 TABLE_NODE_TYPE = "schemaTable"
 
@@ -479,12 +485,36 @@ async def _invoke_llm(prompt: str, output_tokens: int) -> tuple[str, int, str]:
 async def generate_schema_flow(
     *,
     tenant_id: str,
+    project_id: str | None = None,
+    intake_id: str | None = None,
     structured: dict[str, Any],
     current_nodes: list[dict[str, Any]],
     current_edges: list[dict[str, Any]],
     user_request: str,
     latest_sdd_content: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
+    retrieved_chunks: list[str] = []
+    if project_id:
+        try:
+            await sync_project_knowledge_chunks(tenant_id=tenant_id, project_id=project_id)
+            retrieval_query = "\n".join(
+                [
+                    f"user_request: {user_request}",
+                    f"project_name: {structured.get('project_name')}",
+                    "features: " + ", ".join(str(x) for x in (structured.get("desired_features") or [])),
+                    "constraints: " + ", ".join(str(x) for x in ((structured.get("constraints") or {}).get("hard_constraints") or [])),
+                ]
+            )
+            retrieved_chunks = await retrieve_project_knowledge_chunks(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                query_text=retrieval_query,
+                top_k=6,
+            )
+        except Exception:
+            retrieved_chunks = []
+
     sdd_excerpt = (latest_sdd_content or "").strip()
     if len(sdd_excerpt) > 12000:
         sdd_excerpt = sdd_excerpt[:12000]
@@ -493,6 +523,7 @@ async def generate_schema_flow(
         "desired_features": structured.get("desired_features") or [],
         "constraints": (structured.get("constraints") or {}).get("hard_constraints") or [],
         "latest_system_design_context": sdd_excerpt,
+        "retrieved_project_knowledge_chunks": retrieved_chunks,
         "current_nodes": current_nodes,
         "current_edges": current_edges,
         "user_request": user_request,
@@ -534,6 +565,20 @@ async def generate_schema_flow(
                 stage_name="schema_flow",
                 retry_count=attempt,
             )
+            if project_id:
+                try:
+                    source_id = f"{intake_id or 'unknown'}:{run_id or 'direct'}"
+                    source_ver = int(datetime.utcnow().timestamp())
+                    await store_project_source_text(
+                        tenant_id=tenant_id,
+                        project_id=project_id,
+                        source_type="schema",
+                        source_id=source_id,
+                        source_version=source_ver,
+                        text=_build_summary(output.get("nodes") or [], output.get("edges") or []),
+                    )
+                except Exception:
+                    pass
             return output
         except (ValidationError, ValueError, SyntaxError) as exc:
             last_error = exc

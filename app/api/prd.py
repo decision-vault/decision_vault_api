@@ -358,6 +358,29 @@ def _as_aware_dt(value) -> datetime | None:
     return value
 
 
+async def _fallback_prd_documents_for_project(project_id: str, tenant_id: str) -> list[dict]:
+    db = get_db()
+    tenant_oid = _as_oid(tenant_id, "tenant_id")
+    project_oid = _as_oid(project_id, "project_id")
+
+    docs = await db.prd_documents.find(
+        {"tenant_id": tenant_oid, "project_id": project_oid}
+    ).sort([("generated_at", -1), ("version", -1)]).to_list(length=500)
+    if docs:
+        return docs
+
+    intake_docs = await db.requirements_intakes.find(
+        {"tenant_id": tenant_oid, "project_id": project_oid},
+        {"_id": 1},
+    ).to_list(length=500)
+    intake_ids = [d.get("_id") for d in intake_docs if d.get("_id")]
+    if not intake_ids:
+        return []
+    return await db.prd_documents.find(
+        {"intake_id": {"$in": intake_ids}}
+    ).sort([("generated_at", -1), ("version", -1)]).to_list(length=500)
+
+
 def _resolve_llm_stream_config() -> tuple[str, str, str | None]:
     provider = (settings.llm_provider or "").strip().lower()
     if provider == "huggingface":
@@ -627,6 +650,8 @@ async def _run_prd_job(
         result = await generate_multistep_prd(
             payload,
             tenant_id=tenant_id,
+            project_id=project_id,
+            run_id=str(run_id),
             progress_cb=lambda ev: _append_run_event(run_id, ev),
             control_cb=lambda: _get_run_controls(run_id),
         )
@@ -762,7 +787,12 @@ async def generate_prd(
         return clarification
 
     try:
-        multi = await generate_multistep_prd(payload, tenant_id=user.get("tenant_id"))
+        multi = await generate_multistep_prd(
+            payload,
+            tenant_id=user.get("tenant_id"),
+            project_id=project_id,
+            run_id=None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -805,7 +835,12 @@ async def generate_prd_multistep(
         payload=payload,
     )
     try:
-        result = await generate_multistep_prd(payload, tenant_id=user.get("tenant_id"))
+        result = await generate_multistep_prd(
+            payload,
+            tenant_id=user.get("tenant_id"),
+            project_id=project_id,
+            run_id=None,
+        )
     except ValueError as exc:
         logger.warning(
             "prd_multistep_bad_request project_id=%s tenant_id=%s detail=%s",
@@ -1211,13 +1246,30 @@ async def generate_prd_stream(
 @router.get("/latest")
 async def get_latest_prd(
     project_id: str | None = None,
-    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
-    latest = await get_latest_prd_version(project_id)
-    if not latest:
+    latest_pg = await get_latest_prd_version(project_id)
+    fallback_docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id"))
+    latest_fb = None
+    if fallback_docs:
+        fallback = fallback_docs[0]
+        latest_fb = {
+            "project_id": project_id,
+            "version_number": fallback.get("version"),
+            "created_by": str(fallback.get("created_by") or user.get("user_id") or ""),
+            "created_at": fallback.get("generated_at") or fallback.get("created_at"),
+            "markdown_content": fallback.get("content") or "",
+        }
+
+    if not latest_pg and not latest_fb:
         raise HTTPException(status_code=404, detail="PRD not found")
+
+    if latest_pg and latest_fb:
+        latest = latest_pg if int(latest_pg.get("version_number") or 0) >= int(latest_fb.get("version_number") or 0) else latest_fb
+    else:
+        latest = latest_pg or latest_fb
     return {
         "project_id": latest["project_id"],
         "version": latest["version_number"],
@@ -1285,11 +1337,40 @@ async def export_prd(
 @router.get("/versions")
 async def get_prd_versions(
     project_id: str | None = None,
-    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
     versions = await list_prd_versions(project_id)
+    by_version: dict[int, dict] = {}
+    for v in versions:
+        num = int(v.get("version_number") or 0)
+        if num <= 0:
+            continue
+        by_version[num] = v
+
+    docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id"))
+    for d in docs:
+        version = d.get("version")
+        if version is None:
+            continue
+        num = int(version)
+        existing = by_version.get(num)
+        candidate = {
+            "project_id": project_id,
+            "version_number": num,
+            "created_by": str(d.get("created_by") or user.get("user_id") or ""),
+            "created_at": d.get("generated_at") or d.get("created_at"),
+        }
+        if not existing:
+            by_version[num] = candidate
+            continue
+        existing_at = existing.get("created_at") or datetime.min.replace(tzinfo=timezone.utc)
+        current_at = candidate.get("created_at") or datetime.min.replace(tzinfo=timezone.utc)
+        if current_at > existing_at:
+            by_version[num] = candidate
+
+    versions = sorted(by_version.values(), key=lambda x: int(x.get("version_number") or 0), reverse=True)
     return {"items": versions}
 
 
@@ -1297,13 +1378,24 @@ async def get_prd_versions(
 async def get_prd_by_version(
     version_number: int,
     project_id: str | None = None,
-    _user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
     doc = await get_prd_version(project_id, version_number)
     if not doc:
-        raise HTTPException(status_code=404, detail="PRD version not found")
+        fallback_docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id"))
+        matching = [d for d in fallback_docs if int(d.get("version") or -1) == int(version_number)]
+        fallback = matching[0] if matching else None
+        if not fallback:
+            raise HTTPException(status_code=404, detail="PRD version not found")
+        doc = {
+            "project_id": project_id,
+            "version_number": fallback.get("version"),
+            "created_by": str(fallback.get("created_by") or user.get("user_id") or ""),
+            "created_at": fallback.get("generated_at") or fallback.get("created_at"),
+            "markdown_content": fallback.get("content") or "",
+        }
     return {
         "project_id": doc["project_id"],
         "version": doc["version_number"],

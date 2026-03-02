@@ -10,6 +10,11 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.core.config import settings
 from app.services.llm_usage_service import log_llm_usage
+from app.services.project_vector_memory_service import (
+    retrieve_project_knowledge_chunks,
+    store_project_source_text,
+    sync_project_knowledge_chunks,
+)
 from app.services.token_limiter import TokenLimiter
 
 SYSTEM_RULES = (
@@ -571,7 +576,35 @@ Out of Scope:
 """
 
 
-async def generate_system_design(prd: dict, tenant_id: str, progress_cb=None) -> str:
+async def generate_system_design(
+    prd: dict,
+    tenant_id: str,
+    project_id: str | None = None,
+    intake_id: str | None = None,
+    run_id: str | None = None,
+    progress_cb=None,
+) -> str:
+    retrieved_chunks: list[str] = []
+    if project_id:
+        try:
+            await sync_project_knowledge_chunks(tenant_id=tenant_id, project_id=project_id)
+            retrieval_query = "\n".join(
+                [
+                    f"project_name: {prd.get('project_name')}",
+                    f"problem_statement: {prd.get('problem_statement')}",
+                    "desired_features: " + ", ".join(str(x) for x in (prd.get("desired_features") or [])),
+                    "tech_stack: " + ", ".join(str(x) for x in (prd.get("tech_stack") or [])),
+                ]
+            )
+            retrieved_chunks = await retrieve_project_knowledge_chunks(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                query_text=retrieval_query,
+                top_k=6,
+            )
+        except Exception:
+            retrieved_chunks = []
+
     stage1 = await _run_stage(
         stage_name="sdd_stage_1_context",
         schema=Stage1Output,
@@ -588,6 +621,7 @@ async def generate_system_design(prd: dict, tenant_id: str, progress_cb=None) ->
             "constraints": (prd.get("constraints") or {}).get("hard_constraints"),
             "out_of_scope": prd.get("out_of_scope"),
             "tech_stack": prd.get("tech_stack"),
+            "retrieved_project_knowledge_chunks": retrieved_chunks,
         },
         tenant_id=tenant_id,
         progress_cb=progress_cb,
@@ -606,6 +640,7 @@ async def generate_system_design(prd: dict, tenant_id: str, progress_cb=None) ->
             "architecture_decisions": prd.get("architecture_decisions"),
             "tech_stack": prd.get("tech_stack"),
             "constraints": (prd.get("constraints") or {}).get("hard_constraints"),
+            "retrieved_project_knowledge_chunks": retrieved_chunks,
         },
         tenant_id=tenant_id,
         progress_cb=progress_cb,
@@ -623,6 +658,7 @@ async def generate_system_design(prd: dict, tenant_id: str, progress_cb=None) ->
             "architecture_decisions": prd.get("architecture_decisions"),
             "non_functional": prd.get("non_functional"),
             "success_metrics": prd.get("success_metrics"),
+            "retrieved_project_knowledge_chunks": retrieved_chunks,
         },
         tenant_id=tenant_id,
         progress_cb=progress_cb,
@@ -640,9 +676,25 @@ async def generate_system_design(prd: dict, tenant_id: str, progress_cb=None) ->
             "tech_stack": prd.get("tech_stack"),
             "non_functional": prd.get("non_functional"),
             "constraints": (prd.get("constraints") or {}).get("hard_constraints"),
+            "retrieved_project_knowledge_chunks": retrieved_chunks,
         },
         tenant_id=tenant_id,
         progress_cb=progress_cb,
     )
 
-    return _render_sdd(prd, stage1, stage2, stage3, stage4)
+    rendered = _render_sdd(prd, stage1, stage2, stage3, stage4)
+    if project_id:
+        try:
+            source_id = f"{intake_id or 'unknown'}:{run_id or 'direct'}"
+            source_ver = int(_utcnow().timestamp())
+            await store_project_source_text(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                source_type="sdd",
+                source_id=source_id,
+                source_version=source_ver,
+                text=rendered,
+            )
+        except Exception:
+            pass
+    return rendered
