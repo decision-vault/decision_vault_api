@@ -418,6 +418,19 @@ class PRDOrchestrator:
         return patched
 
     @classmethod
+    def _fill_missing_schema_fields(cls, payload: dict[str, Any], schema: type[BaseModel]) -> dict[str, Any]:
+        patched = dict(payload)
+        for field_name, field in schema.model_fields.items():
+            if field_name in patched and patched[field_name] not in (None, ""):
+                continue
+            origin = get_origin(field.annotation)
+            if origin is list:
+                patched[field_name] = []
+            else:
+                patched[field_name] = "Insufficient information provided."
+        return patched
+
+    @classmethod
     def _sanitize_obj(cls, value: Any) -> Any:
         if isinstance(value, str):
             return cls._sanitize_text(value)
@@ -429,10 +442,52 @@ class PRDOrchestrator:
         return value
 
     @staticmethod
-    def _extract_json_block(text: str) -> str:
+    def _normalize_json_candidate(text: str) -> str:
         cleaned = (text or "").strip()
+        cleaned = cleaned.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
+        cleaned = re.sub(r"^\s*json\s*", "", cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
+
+    @staticmethod
+    def _balance_json_like(text: str) -> str:
+        stack: list[str] = []
+        out: list[str] = []
+        in_string = False
+        escape = False
+        pairs = {"{": "}", "[": "]"}
+        for ch in text:
+            if in_string:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+                continue
+            if ch in "{[":
+                stack.append(pairs[ch])
+                out.append(ch)
+                continue
+            if ch in "}]":
+                if stack and ch == stack[-1]:
+                    stack.pop()
+                    out.append(ch)
+                continue
+            out.append(ch)
+        while stack:
+            out.append(stack.pop())
+        return "".join(out)
+
+    @staticmethod
+    def _extract_json_block(text: str) -> str:
+        cleaned = PRDOrchestrator._normalize_json_candidate(text)
 
         # Try to extract the first balanced JSON object to avoid malformed tail content.
         start = cleaned.find("{")
@@ -466,9 +521,7 @@ class PRDOrchestrator:
 
     @staticmethod
     def _repair_truncated_json(text: str) -> str:
-        candidate = (text or "").strip()
-        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
-        candidate = re.sub(r"\s*```$", "", candidate)
+        candidate = PRDOrchestrator._normalize_json_candidate(text)
         start = candidate.find("{")
         if start >= 0:
             candidate = candidate[start:]
@@ -513,6 +566,7 @@ class PRDOrchestrator:
                 parsed = ast.literal_eval(candidate)
             except Exception:
                 repaired = cls._repair_truncated_json(candidate)
+                balanced = cls._balance_json_like(repaired)
                 try:
                     parsed = json.loads(repaired)
                 except Exception:
@@ -520,14 +574,21 @@ class PRDOrchestrator:
                         parsed = ast.literal_eval(repaired)
                     except Exception as exc:
                         try:
-                            parsed = cls._parse_loose_by_schema(repaired, schema)
+                            parsed = json.loads(balanced)
                         except Exception:
-                            raise ValueError(f"Unable to parse JSON output: {exc}")
+                            try:
+                                parsed = ast.literal_eval(balanced)
+                            except Exception:
+                                try:
+                                    parsed = cls._parse_loose_by_schema(balanced, schema)
+                                except Exception:
+                                    raise ValueError(f"Unable to parse JSON output: {exc}")
 
         if not isinstance(parsed, dict):
             raise ValueError("Structured output must be a JSON object")
         parsed = cls._sanitize_obj(parsed)
         parsed = cls._coerce_schema_lists(parsed, schema)
+        parsed = cls._fill_missing_schema_fields(parsed, schema)
         try:
             return schema.model_validate(parsed)
         except ValidationError as exc:
@@ -539,7 +600,7 @@ class PRDOrchestrator:
         fields = list(schema.model_fields.keys())
         positions: list[tuple[str, int, int]] = []
         for key in fields:
-            m = re.search(rf'"{re.escape(key)}"\s*:', text)
+            m = re.search(rf'(?<![A-Za-z0-9_])"?{re.escape(key)}"?\s*:', text)
             if m:
                 positions.append((key, m.start(), m.end()))
         if not positions:

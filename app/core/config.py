@@ -32,6 +32,7 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
         "http://127.0.0.1:4173",
         "http://127.0.0.1:8081",
+        "https://decision-vault-api-ujco-gkgai10tj-kaviyarasumarans-projects.vercel.app",
     ]
     cors_allow_methods: list[str] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     cors_allow_headers: list[str] = ["*"]
@@ -98,9 +99,9 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2
     llm_api_key: str = "AIzaSyDgU2vgycUahBqvViPh9oFezpuD7L9GAgM"
     llm_base_url: str | None = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    llm_max_input_tokens: int = 3000
-    llm_max_output_tokens: int = 1800
-    prd_generation_timeout_seconds: int = 180
+    llm_max_input_tokens: int = 20000
+    llm_max_output_tokens: int = 20000
+    prd_generation_timeout_seconds: int = 5000
 
     hf_api_token: str = "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"
     hf_model_name: str = "Qwen/Qwen2-0.5B-Instruct"
@@ -108,7 +109,7 @@ class Settings(BaseSettings):
     hf_router_base_url: str = "https://router.huggingface.co/v1"
     hf_openai_model: str = "Qwen/Qwen2.5-7B-Instruct:together"
     lmstudio_base_url: str = "http://localhost:1234/api/v1"
-    lmstudio_model: str = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+    lmstudio_model: str = "qwen/qwen3.5-9b"
     remote_provider: str = "lmstudio"
     lmstudio_chat_path: str = "/chat"
     model_run_mode: str = "remote"

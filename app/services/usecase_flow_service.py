@@ -557,15 +557,76 @@ async def generate_usecase_flow(
         "user_request": user_request,
     }
     input_json = json.dumps(payload, ensure_ascii=False)
+    example_output = json.dumps(
+        {
+            "nodes": [
+                {
+                    "id": "user",
+                    "type": "sequenceParticipant",
+                    "position": {"x": 80, "y": 100},
+                    "data": {"name": "End User"},
+                },
+                {
+                    "id": "web_app",
+                    "type": "sequenceParticipant",
+                    "position": {"x": 340, "y": 100},
+                    "data": {"name": "Web App"},
+                },
+                {
+                    "id": "auth_service",
+                    "type": "sequenceParticipant",
+                    "position": {"x": 600, "y": 100},
+                    "data": {"name": "Auth Service"},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "e-user-web-app-login",
+                    "source": "user",
+                    "target": "web_app",
+                    "label": "Submit login",
+                    "data": {"label": "Submit login"},
+                },
+                {
+                    "id": "e-web-app-auth-service-verify",
+                    "source": "web_app",
+                    "target": "auth_service",
+                    "label": "Verify credentials",
+                    "data": {"label": "Verify credentials"},
+                },
+                {
+                    "id": "e-auth-service-web-app-token",
+                    "source": "auth_service",
+                    "target": "web_app",
+                    "label": "Return access token",
+                    "data": {"label": "Return access token"},
+                },
+                {
+                    "id": "e-web-app-user-success",
+                    "source": "web_app",
+                    "target": "user",
+                    "label": "Show login success",
+                    "data": {"label": "Show login success"},
+                },
+            ],
+            "summary": "User logs in through Web App, which validates credentials with Auth Service and returns success.",
+        },
+        ensure_ascii=False,
+    )
     base_prompt = (
         "You are a systems analyst assistant. "
-        "Build/update a use-case interaction diagram for React Flow. "
-        "Return JSON only with keys: nodes, edges, summary. "
-        "No markdown, no extra keys. "
-        "Node shape: {id,type:'sequenceParticipant',position:{x,y},data:{name}}. "
-        "Edge shape: {id,source,target,label,data:{label}}. "
-        "Represent actors/services/components as participants and API/process interactions as edges with labels. "
-        "Keep existing IDs stable when possible.\n\n"
+        "Build or update a use-case interaction diagram for React Flow from the provided context. "
+        "Return JSON only with exactly these top-level keys: nodes, edges, summary. "
+        "Do not return markdown, explanations, or extra keys. "
+        "Node schema: {id,type:'sequenceParticipant',position:{x,y},data:{name}}. "
+        "Edge schema: {id,source,target,label,data:{label}}. "
+        "Use short, stable snake_case ids. "
+        "If a participant already exists in current_nodes, keep the same id. "
+        "Every edge source/target must reference an existing node id. "
+        "Use action-oriented labels (verb + object), e.g., 'Create order', 'Validate OTP', 'Send confirmation email'. "
+        "Avoid duplicate edges with the same source, target, and label. "
+        "Summary must be one concise sentence describing the end-to-end flow.\n\n"
+        f"Example valid output:\n{example_output}\n\n"
         f"Input:\n{input_json}"
     )
 

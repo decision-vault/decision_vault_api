@@ -44,6 +44,12 @@ PDF_LOGO_PATH = Path(__file__).resolve().parents[3] / "decision_vault_ui" / "src
 RUN_STALE_TIMEOUT_SECONDS = 120
 _ACTIVE_PRD_TASKS: set[asyncio.Task] = set()
 _ACTIVE_PRD_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
+PRD_STAGE_SEQUENCE = [
+    "stage_1_core_context",
+    "stage_2_scope_user_stories",
+    "stage_3_architecture",
+    "stage_4_delivery_quality",
+]
 
 
 def _strip_markdown(md: str) -> str:
@@ -358,6 +364,30 @@ def _as_aware_dt(value) -> datetime | None:
     return value
 
 
+def _prd_steps_are_complete(steps: list[dict] | None) -> bool:
+    if not isinstance(steps, list):
+        return False
+    completed = {
+        str(step.get("stage")): str(step.get("status") or "").lower()
+        for step in steps
+        if isinstance(step, dict) and step.get("stage")
+    }
+    return all(completed.get(stage) == "completed" for stage in PRD_STAGE_SEQUENCE)
+
+
+def _apply_prd_version_label(markdown: str, version_number: int | str | None) -> str:
+    if not markdown:
+        return ""
+    if version_number in (None, "", 0):
+        return markdown
+    version_label = f"{version_number}.0" if isinstance(version_number, int) else str(version_number)
+    pattern = r"(?m)^\*\*Version:\*\*\s*.+$"
+    replacement = f"**Version:** {version_label}"
+    if re.search(pattern, markdown):
+        return re.sub(pattern, replacement, markdown, count=1)
+    return markdown
+
+
 async def _fallback_prd_documents_for_project(project_id: str, tenant_id: str) -> list[dict]:
     db = get_db()
     tenant_oid = _as_oid(tenant_id, "tenant_id")
@@ -660,6 +690,15 @@ async def _run_prd_job(
             created_by=created_by,
             markdown_content=result.prd_markdown,
         )
+        steps_complete = False
+        for _ in range(5):
+            run_doc = await db.prd_runs.find_one({"_id": run_id}, {"steps": 1})
+            steps_complete = _prd_steps_are_complete((run_doc or {}).get("steps"))
+            if steps_complete:
+                break
+            await asyncio.sleep(0.2)
+        if not steps_complete:
+            raise ValueError("PRD run finished content generation but not all stages were recorded as completed.")
         await db.prd_runs.update_one(
             {"_id": run_id},
             {
@@ -952,6 +991,22 @@ async def get_prd_run_status(
         run_status = doc.get("status")
 
     steps = doc.get("steps", [])
+    has_final_result = isinstance(doc.get("result"), dict) and bool((doc.get("result") or {}).get("prd_markdown"))
+    if run_status == "completed" and (not has_final_result or not _prd_steps_are_complete(steps)):
+        corrected_status = "running" if _as_aware_dt(doc.get("started_at")) else "queued"
+        await db.prd_runs.update_one(
+            {"_id": doc["_id"]},
+            {
+                "$set": {
+                    "status": corrected_status,
+                    "updated_at": now,
+                    "completed_at": None,
+                }
+            },
+        )
+        doc = await db.prd_runs.find_one({"_id": doc["_id"]})
+        run_status = doc.get("status")
+        steps = doc.get("steps", [])
     step_timings: list[dict] = []
     for step in steps:
         started_at = _as_aware_dt(step.get("started_at"))
@@ -1275,7 +1330,7 @@ async def get_latest_prd(
         "version": latest["version_number"],
         "created_by": latest["created_by"],
         "created_at": latest["created_at"],
-        "content": latest["markdown_content"],
+        "content": _apply_prd_version_label(latest["markdown_content"], latest["version_number"]),
         "source": "llm",
     }
 
@@ -1310,8 +1365,8 @@ async def export_prd(
         doc = await get_prd_version(project_id, version) if version else await get_latest_prd_version(project_id)
         if not doc:
             raise HTTPException(status_code=404, detail="PRD not found")
-        markdown = doc.get("markdown_content", "")
         version_number = doc.get("version_number", "latest")
+        markdown = _apply_prd_version_label(doc.get("markdown_content", ""), version_number)
         base_name = f"decisionvault-prd-v{version_number}"
 
     if type == "md":
@@ -1401,6 +1456,6 @@ async def get_prd_by_version(
         "version": doc["version_number"],
         "created_by": doc["created_by"],
         "created_at": doc["created_at"],
-        "content": doc["markdown_content"],
+        "content": _apply_prd_version_label(doc["markdown_content"], doc["version_number"]),
         "source": "llm",
     }

@@ -19,6 +19,7 @@ from app.services.requirements_service import generate_prd, respond_intake, star
 from app.services.prd_service import generate_prd as generate_prd_text, save_prd
 from app.services.schema_flow_service import generate_schema_flow
 from app.services.usecase_flow_service import generate_usecase_flow
+from app.services.architecture_mermaid_service import generate_architecture_mermaid
 from app.services.system_design_service import generate_system_design
 
 
@@ -27,6 +28,7 @@ logger = logging.getLogger("decisionvault.requirements.sdd")
 _ACTIVE_SDD_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
 _ACTIVE_SCHEMA_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
 _ACTIVE_USECASE_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
+_ACTIVE_SEQUENCE_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
 
 
 def _utcnow() -> datetime:
@@ -53,6 +55,35 @@ def _as_oid(value: str, field: str) -> ObjectId:
         return ObjectId(value)
     except Exception:
         raise HTTPException(status_code=400, detail=f"Invalid {field}")
+
+
+def _sequence_to_mermaid(nodes: list[dict], edges: list[dict]) -> str:
+    participants: dict[str, str] = {}
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or "").strip()
+        if not node_id:
+            continue
+        name = str((node.get("data") or {}).get("name") or node_id).strip()
+        participants[node_id] = name or node_id
+
+    lines: list[str] = ["sequenceDiagram"]
+    for node_id, name in participants.items():
+        alias = node_id.replace("-", "_")
+        lines.append(f"    participant {alias} as {name}")
+
+    for edge in edges or []:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "").strip()
+        target = str(edge.get("target") or "").strip()
+        if source not in participants or target not in participants:
+            continue
+        label = str(edge.get("label") or (edge.get("data") or {}).get("label") or "").strip() or "interaction"
+        lines.append(f"    {source.replace('-', '_')}->>{target.replace('-', '_')}: {label}")
+
+    return "\n".join(lines)
 
 
 async def _save_system_design(intake_id: str, project_id: str, tenant_id: str, content: str) -> dict:
@@ -322,9 +353,20 @@ async def _save_usecase_flow(
         "updated_at": now,
     }
     await db.usecase_flow_documents.insert_one(doc)
+    latest_doc = {
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
+        "nodes": doc["nodes"],
+        "edges": doc["edges"],
+        "summary": doc["summary"],
+        "updated_at": now,
+    }
     await db.usecase_flows.update_one(
         {"intake_id": intake_oid, "tenant_id": tenant_oid, "project_id": project_oid},
-        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        {"$set": latest_doc, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
     return doc
@@ -468,6 +510,259 @@ async def _run_usecase_flow_job(
         )
     finally:
         _ACTIVE_USECASE_TASKS_BY_RUN_ID.pop(str(run_id), None)
+
+
+async def _save_sequence_flow(
+    *,
+    intake_id: str,
+    tenant_id: str,
+    project_id: str,
+    result: dict,
+) -> dict:
+    db = get_db()
+    intake_oid = ObjectId(intake_id)
+    tenant_oid = ObjectId(tenant_id)
+    project_oid = ObjectId(project_id)
+    last = await db.sequence_flow_documents.find_one(
+        {
+            "intake_id": intake_oid,
+            "tenant_id": tenant_oid,
+            "project_id": project_oid,
+        },
+        sort=[("version", -1)],
+    )
+    next_version = (last.get("version") if last else 0) + 1
+    now = _utcnow()
+    mermaid = str(result.get("mermaid") or "").strip() or _sequence_to_mermaid(
+        result.get("nodes") or [],
+        result.get("edges") or [],
+    )
+    doc = {
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
+        "nodes": result.get("nodes") or [],
+        "edges": result.get("edges") or [],
+        "mermaid": mermaid,
+        "summary": result.get("summary") or "",
+        "updated_at": now,
+    }
+    await db.sequence_flow_documents.insert_one(doc)
+    latest_doc = {
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
+        "nodes": doc["nodes"],
+        "edges": doc["edges"],
+        "mermaid": doc["mermaid"],
+        "summary": doc["summary"],
+        "updated_at": now,
+    }
+    await db.sequence_flows.update_one(
+        {"intake_id": intake_oid, "tenant_id": tenant_oid, "project_id": project_oid},
+        {"$set": latest_doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return doc
+
+
+async def _save_architecture_diagram(
+    *,
+    intake_id: str,
+    tenant_id: str,
+    project_id: str,
+    result: dict,
+) -> dict:
+    db = get_db()
+    intake_oid = ObjectId(intake_id)
+    tenant_oid = ObjectId(tenant_id)
+    project_oid = ObjectId(project_id)
+    last = await db.architecture_diagram_documents.find_one(
+        {
+            "intake_id": intake_oid,
+            "tenant_id": tenant_oid,
+            "project_id": project_oid,
+        },
+        sort=[("version", -1)],
+    )
+    next_version = (last.get("version") if last else 0) + 1
+    now = _utcnow()
+    mermaid = str(result.get("mermaid") or "").strip()
+    doc = {
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
+        "mermaid": mermaid,
+        "summary": str(result.get("summary") or "").strip(),
+        "view": str(result.get("view") or "").strip(),
+        "updated_at": now,
+    }
+    await db.architecture_diagram_documents.insert_one(doc)
+    latest_doc = {
+        "intake_id": intake_oid,
+        "tenant_id": tenant_oid,
+        "project_id": project_oid,
+        "version": next_version,
+        "generated_at": now,
+        "mermaid": mermaid,
+        "summary": str(result.get("summary") or "").strip(),
+        "view": str(result.get("view") or "").strip(),
+        "updated_at": now,
+    }
+    await db.architecture_diagrams.update_one(
+        {"intake_id": intake_oid, "tenant_id": tenant_oid, "project_id": project_oid},
+        {"$set": latest_doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return doc
+
+
+async def _run_sequence_flow_job(
+    *,
+    run_id: ObjectId,
+    intake_id: str,
+    project_id: str,
+    tenant_id: str,
+    structured: dict,
+    user_request: str,
+    current_nodes: list,
+    current_edges: list,
+    latest_sdd_content: str,
+) -> None:
+    db = get_db()
+    started_at = _utcnow()
+    await db.sequence_flow_runs.update_one(
+        {"_id": run_id},
+        {
+            "$set": {
+                "status": "running",
+                "started_at": started_at,
+                "updated_at": started_at,
+                "steps": [{"stage": "sequence_generation", "status": "running", "started_at": started_at}],
+            }
+        },
+    )
+    try:
+        while True:
+            run_doc = await db.sequence_flow_runs.find_one({"_id": run_id}, {"pause_requested": 1, "stop_requested": 1})
+            if not run_doc:
+                break
+            if run_doc.get("stop_requested"):
+                raise asyncio.CancelledError("Run stopped by user.")
+            if run_doc.get("pause_requested"):
+                await db.sequence_flow_runs.update_one(
+                    {"_id": run_id},
+                    {"$set": {"status": "paused", "updated_at": _utcnow()}},
+                )
+                await asyncio.sleep(1)
+                continue
+            break
+        await db.sequence_flow_runs.update_one({"_id": run_id}, {"$set": {"status": "running", "updated_at": _utcnow()}})
+
+        result = await generate_usecase_flow(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            intake_id=intake_id,
+            structured=structured,
+            current_nodes=current_nodes,
+            current_edges=current_edges,
+            user_request=user_request,
+            latest_sdd_content=latest_sdd_content,
+            run_id=str(run_id),
+        )
+        if not str(result.get("mermaid") or "").strip():
+            result["mermaid"] = _sequence_to_mermaid(result.get("nodes") or [], result.get("edges") or [])
+        run_doc = await db.sequence_flow_runs.find_one({"_id": run_id}, {"stop_requested": 1})
+        if run_doc and run_doc.get("stop_requested"):
+            raise asyncio.CancelledError("Run stopped by user.")
+
+        saved = await _save_sequence_flow(
+            intake_id=intake_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            result=result,
+        )
+        completed_at = _utcnow()
+        await db.sequence_flow_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": completed_at,
+                    "updated_at": completed_at,
+                    "error": None,
+                    "result": {
+                        **result,
+                        "version": saved.get("version"),
+                        "generated_at": saved.get("generated_at"),
+                    },
+                    "steps": [
+                        {
+                            "stage": "sequence_generation",
+                            "status": "completed",
+                            "started_at": started_at,
+                            "completed_at": completed_at,
+                            "duration_seconds": round((completed_at - started_at).total_seconds(), 3),
+                        }
+                    ],
+                }
+            },
+        )
+    except asyncio.CancelledError:
+        stopped_at = _utcnow()
+        await db.sequence_flow_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "stopped",
+                    "completed_at": stopped_at,
+                    "updated_at": stopped_at,
+                    "error": "Run stopped by user.",
+                    "steps": [
+                        {
+                            "stage": "sequence_generation",
+                            "status": "stopped",
+                            "started_at": started_at,
+                            "completed_at": stopped_at,
+                            "duration_seconds": round((stopped_at - started_at).total_seconds(), 3),
+                            "error": "Run stopped by user.",
+                        }
+                    ],
+                }
+            },
+        )
+    except Exception as exc:
+        logger.exception("sequence_flow_run_failed run_id=%s project_id=%s", str(run_id), project_id)
+        failed_at = _utcnow()
+        await db.sequence_flow_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "completed_at": failed_at,
+                    "updated_at": failed_at,
+                    "error": str(exc),
+                    "steps": [
+                        {
+                            "stage": "sequence_generation",
+                            "status": "failed",
+                            "started_at": started_at,
+                            "completed_at": failed_at,
+                            "duration_seconds": round((failed_at - started_at).total_seconds(), 3),
+                            "error": str(exc),
+                        }
+                    ],
+                }
+            },
+        )
+    finally:
+        _ACTIVE_SEQUENCE_TASKS_BY_RUN_ID.pop(str(run_id), None)
 
 
 async def _run_schema_flow_job(
@@ -1548,6 +1843,8 @@ async def generate_usecase_flow_doc(
             latest_sdd_content=latest_sdd_content,
             run_id=None,
         )
+        if not str(result.get("mermaid") or "").strip():
+            result["mermaid"] = _sequence_to_mermaid(result.get("nodes") or [], result.get("edges") or [])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     saved = await _save_usecase_flow(
@@ -1766,10 +2063,12 @@ async def get_usecase_flow_doc(
         }
     )
     if not doc:
-        return {"nodes": [], "edges": [], "summary": "", "updated_at": None, "exists": False}
+        return {"nodes": [], "edges": [], "mermaid": "sequenceDiagram", "summary": "", "updated_at": None, "exists": False}
+    mermaid = str(doc.get("mermaid") or "").strip() or _sequence_to_mermaid(doc.get("nodes") or [], doc.get("edges") or [])
     return {
         "nodes": doc.get("nodes") or [],
         "edges": doc.get("edges") or [],
+        "mermaid": mermaid,
         "summary": doc.get("summary") or "",
         "version": doc.get("version"),
         "generated_at": doc.get("generated_at"),
@@ -1831,6 +2130,484 @@ async def get_usecase_flow_version(
         "nodes": doc.get("nodes") or [],
         "edges": doc.get("edges") or [],
         "summary": doc.get("summary") or "",
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+        "updated_at": doc.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.post("/{intake_id}/generate-sequence-flow")
+async def generate_sequence_flow_doc(
+    intake_id: str,
+    payload: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    intake = await db.requirements_intakes.find_one({"_id": ObjectId(intake_id)})
+    if not intake:
+        raise HTTPException(status_code=404, detail="Intake not found")
+    structured = intake.get("structured") or {}
+    user_request = str(payload.get("request") or "").strip()
+    if not user_request:
+        raise HTTPException(status_code=400, detail="request is required")
+    current_nodes = payload.get("nodes") or []
+    current_edges = payload.get("edges") or []
+    latest_sdd_content = await _get_latest_sdd_content(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+    )
+    try:
+        result = await generate_usecase_flow(
+            tenant_id=user.get("tenant_id"),
+            project_id=project_id,
+            intake_id=intake_id,
+            structured=structured,
+            current_nodes=current_nodes,
+            current_edges=current_edges,
+            user_request=user_request,
+            latest_sdd_content=latest_sdd_content,
+            run_id=None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    saved = await _save_sequence_flow(
+        intake_id=intake_id,
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        result=result,
+    )
+    return {
+        **result,
+        "version": saved.get("version"),
+        "generated_at": saved.get("generated_at"),
+    }
+
+
+@router.post("/{intake_id}/generate-sequence-flow/run")
+async def generate_sequence_flow_run(
+    intake_id: str,
+    payload: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    intake = await db.requirements_intakes.find_one({"_id": ObjectId(intake_id)})
+    if not intake:
+        raise HTTPException(status_code=404, detail="Intake not found")
+
+    structured = intake.get("structured") or {}
+    user_request = str(payload.get("request") or "").strip()
+    if not user_request:
+        user_request = "Generate initial sequence interaction diagram from requirements and architecture inputs."
+    current_nodes = payload.get("nodes") or []
+    current_edges = payload.get("edges") or []
+    latest_sdd_content = await _get_latest_sdd_content(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+    )
+
+    run_id = ObjectId()
+    created_at = _utcnow()
+    await db.sequence_flow_runs.insert_one(
+        {
+            "_id": run_id,
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+            "intake_id": ObjectId(intake_id),
+            "status": "queued",
+            "pause_requested": False,
+            "stop_requested": False,
+            "steps": [],
+            "error": None,
+            "result": None,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": None,
+            "completed_at": None,
+            "request": user_request,
+        }
+    )
+    task = asyncio.create_task(
+        _run_sequence_flow_job(
+            run_id=run_id,
+            intake_id=intake_id,
+            project_id=project_id,
+            tenant_id=user.get("tenant_id"),
+            structured=structured,
+            user_request=user_request,
+            current_nodes=current_nodes,
+            current_edges=current_edges,
+            latest_sdd_content=latest_sdd_content,
+        )
+    )
+    _ACTIVE_SEQUENCE_TASKS_BY_RUN_ID[str(run_id)] = task
+    return {"run_id": str(run_id), "status": "queued"}
+
+
+@router.get("/sequence-flow/runs/{run_id}")
+async def get_sequence_flow_run_status(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.sequence_flow_runs.find_one(
+        {
+            "_id": oid,
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Sequence flow run not found")
+    total_elapsed = None
+    started_at = _coerce_utc_datetime(doc.get("started_at"))
+    if started_at:
+        end_time = _coerce_utc_datetime(doc.get("completed_at")) or _utcnow()
+        total_elapsed = round((end_time - started_at).total_seconds(), 3)
+    return {
+        "run_id": str(doc.get("_id")),
+        "status": doc.get("status"),
+        "steps": doc.get("steps") or [],
+        "error": doc.get("error"),
+        "result": doc.get("result"),
+        "timing": {"total_elapsed_seconds": total_elapsed},
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+        "started_at": doc.get("started_at"),
+        "completed_at": doc.get("completed_at"),
+    }
+
+
+@router.post("/sequence-flow/runs/{run_id}/pause")
+async def pause_sequence_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.sequence_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Sequence flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.sequence_flow_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": True, "status": "paused", "updated_at": _utcnow()}},
+    )
+    return {"run_id": run_id, "status": "paused"}
+
+
+@router.post("/sequence-flow/runs/{run_id}/resume")
+async def resume_sequence_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.sequence_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Sequence flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    await db.sequence_flow_runs.update_one(
+        {"_id": oid},
+        {"$set": {"pause_requested": False, "status": "running", "updated_at": _utcnow()}},
+    )
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.post("/sequence-flow/runs/{run_id}/stop")
+async def stop_sequence_flow_run(
+    run_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.sequence_flow_runs.find_one(
+        {"_id": oid, "tenant_id": ObjectId(user.get("tenant_id")), "project_id": ObjectId(project_id)}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Sequence flow run not found")
+    if doc.get("status") in {"completed", "failed", "stopped"}:
+        return {"run_id": run_id, "status": doc.get("status")}
+    now = _utcnow()
+    await db.sequence_flow_runs.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "stop_requested": True,
+                "pause_requested": False,
+                "status": "stopped",
+                "completed_at": now,
+                "updated_at": now,
+                "error": "Run stopped by user.",
+            }
+        },
+    )
+    task = _ACTIVE_SEQUENCE_TASKS_BY_RUN_ID.get(run_id)
+    if task and not task.done():
+        task.cancel()
+    return {"run_id": run_id, "status": "stopped"}
+
+
+@router.get("/{intake_id}/sequence-flow")
+async def get_sequence_flow_doc(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.sequence_flows.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        }
+    )
+    if not doc:
+        return {"nodes": [], "edges": [], "summary": "", "updated_at": None, "exists": False}
+    return {
+        "nodes": doc.get("nodes") or [],
+        "edges": doc.get("edges") or [],
+        "summary": doc.get("summary") or "",
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+        "updated_at": doc.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.get("/{intake_id}/sequence-flow/versions")
+async def get_sequence_flow_versions(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    docs = await db.sequence_flow_documents.find(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        },
+        {"version": 1, "generated_at": 1, "updated_at": 1},
+    ).sort("version", -1).to_list(length=200)
+    return {
+        "items": [
+            {
+                "version_number": d.get("version"),
+                "generated_at": d.get("generated_at"),
+                "updated_at": d.get("updated_at"),
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.get("/{intake_id}/sequence-flow/versions/{version_number}")
+async def get_sequence_flow_version(
+    intake_id: str,
+    version_number: int,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.sequence_flow_documents.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+            "version": version_number,
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Sequence flow version not found")
+    mermaid = str(doc.get("mermaid") or "").strip() or _sequence_to_mermaid(doc.get("nodes") or [], doc.get("edges") or [])
+    return {
+        "nodes": doc.get("nodes") or [],
+        "edges": doc.get("edges") or [],
+        "mermaid": mermaid,
+        "summary": doc.get("summary") or "",
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+        "updated_at": doc.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.post("/{intake_id}/generate-architecture-diagram")
+async def generate_architecture_diagram_doc(
+    intake_id: str,
+    payload: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    intake = await db.requirements_intakes.find_one({"_id": ObjectId(intake_id)})
+    if not intake:
+        raise HTTPException(status_code=404, detail="Intake not found")
+    structured = intake.get("structured") or {}
+
+    user_request = str(payload.get("request") or "").strip()
+    if not user_request:
+        user_request = "Show the high-level system architecture with Load Balancer and AWS components."
+    latest_sdd_content = await _get_latest_sdd_content(
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+    )
+
+    try:
+        result = await generate_architecture_mermaid(
+            user_request=user_request,
+            structured=structured,
+            latest_sdd_content=latest_sdd_content,
+            tenant_id=user.get("tenant_id"),
+            project_id=project_id,
+            intake_id=intake_id,
+            run_id=None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    saved = await _save_architecture_diagram(
+        intake_id=intake_id,
+        tenant_id=user.get("tenant_id"),
+        project_id=project_id,
+        result=result,
+    )
+    return {
+        "mermaid": result.get("mermaid") or "",
+        "summary": result.get("summary") or "",
+        "view": result.get("view") or "",
+        "version": saved.get("version"),
+        "generated_at": saved.get("generated_at"),
+        "updated_at": saved.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.get("/{intake_id}/architecture-diagram")
+async def get_architecture_diagram_doc(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.architecture_diagrams.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        }
+    )
+    if not doc:
+        return {
+            "mermaid": "",
+            "summary": "",
+            "view": "",
+            "version": None,
+            "generated_at": None,
+            "updated_at": None,
+            "exists": False,
+        }
+    return {
+        "mermaid": str(doc.get("mermaid") or ""),
+        "summary": str(doc.get("summary") or ""),
+        "view": str(doc.get("view") or ""),
+        "version": doc.get("version"),
+        "generated_at": doc.get("generated_at"),
+        "updated_at": doc.get("updated_at"),
+        "exists": True,
+    }
+
+
+@router.get("/{intake_id}/architecture-diagram/versions")
+async def get_architecture_diagram_versions(
+    intake_id: str,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    docs = await db.architecture_diagram_documents.find(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        },
+        {"version": 1, "view": 1, "generated_at": 1, "updated_at": 1},
+    ).sort("version", -1).to_list(length=200)
+    return {
+        "items": [
+            {
+                "version_number": d.get("version"),
+                "view": d.get("view"),
+                "generated_at": d.get("generated_at"),
+                "updated_at": d.get("updated_at"),
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.get("/{intake_id}/architecture-diagram/versions/{version_number}")
+async def get_architecture_diagram_version(
+    intake_id: str,
+    version_number: int,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    db = get_db()
+    doc = await db.architecture_diagram_documents.find_one(
+        {
+            "intake_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+            "version": version_number,
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Architecture diagram version not found")
+    return {
+        "mermaid": str(doc.get("mermaid") or ""),
+        "summary": str(doc.get("summary") or ""),
+        "view": str(doc.get("view") or ""),
         "version": doc.get("version"),
         "generated_at": doc.get("generated_at"),
         "updated_at": doc.get("updated_at"),
