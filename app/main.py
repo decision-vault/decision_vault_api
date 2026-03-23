@@ -23,6 +23,7 @@ from app.api.hf_inference import router as hf_inference_router
 from app.api.requirements import router as requirements_router
 from app.api.messenger import router as messenger_router
 from app.api.prd import router as prd_router
+from app.api.demo import router as demo_router
 from app.services.prd_pg_service import ensure_prd_table
 from app.services.llm_usage_service import ensure_usage_table
 from app.services.requirements_service import validate_structured, compute_ready_for_prd
@@ -133,6 +134,8 @@ async def startup() -> None:
     await db.prd_runs.create_index([("project_id", 1), ("status", 1), ("updated_at", -1)])
     await db.prd_clarifications.create_index([("tenant_id", 1), ("project_id", 1), ("user_id", 1)], unique=True)
     await db.prd_clarifications.create_index([("project_id", 1), ("updated_at", -1)])
+    await db.demo_requests.create_index([("created_at", -1)])
+    await db.demo_requests.create_index([("email", 1), ("created_at", -1)])
     if settings.enable_rate_limiter:
         try:
             redis_client = redis.from_url(settings.redis_url)
@@ -193,6 +196,7 @@ app.include_router(hf_inference_router)
 app.include_router(requirements_router)
 app.include_router(messenger_router)
 app.include_router(prd_router)
+app.include_router(demo_router)
 
 
 @app.get("/health")
