@@ -60,6 +60,9 @@ def _build_user(
         "email": email.lower(),
         "role": role,
         "provider": provider,
+        "is_active": True,
+        "deleted_at": None,
+        "deleted_by": None,
         "created_at": _utcnow(),
         "last_login_at": None,
     }
@@ -160,6 +163,11 @@ async def login(tenant_id: str | None, tenant_slug: str | None, email: str, pass
     if not tenant:
         raise ValueError("Tenant not found")
 
+    if user.get("deleted_at") is not None:
+        raise ValueError("Account deleted")
+    if user.get("is_active", True) is False:
+        raise ValueError("Account deactivated")
+
     if "password_hash" not in user or not verify_password(password, user["password_hash"]):
         raise ValueError("Invalid credentials")
 
@@ -195,6 +203,11 @@ async def refresh(refresh_token: str) -> dict:
     user = await db.users.find_one({"_id": _oid(payload["sub"])})
     if not user:
         raise ValueError("User not found")
+
+    if user.get("deleted_at") is not None:
+        raise ValueError("Account deleted")
+    if user.get("is_active", True) is False:
+        raise ValueError("Account deactivated")
 
     if str(user.get("tenant_id")) != payload.get("tenant_id"):
         raise ValueError("Tenant mismatch")
@@ -243,6 +256,11 @@ async def google_login(
         user_doc["_id"] = user_insert.inserted_id
         await db.licenses.insert_one(_build_trial_license(tenant["_id"]))
         user = user_doc
+    else:
+        if user.get("deleted_at") is not None:
+            raise ValueError("Account deleted")
+        if user.get("is_active", True) is False:
+            raise ValueError("Account deactivated")
 
     tokens = _issue_tokens(user)
     await _store_refresh_token(user, tokens)

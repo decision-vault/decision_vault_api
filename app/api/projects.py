@@ -5,8 +5,17 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.middleware.guard import withGuard
 from app.schemas.project import ProjectCreate, ProjectOut, ProjectUpdate
+from app.schemas.project_access import ProjectAccessRequestOut, ProjectCatalogOut, ProjectInviteByEmail
 from app.services.audit_service import log_event
 from app.services.project_member_service import add_project_member
+from app.services.project_access_service import (
+    decide_access_request,
+    invite_user_to_project_by_email,
+    list_access_requests,
+    list_my_access_requests,
+    list_project_catalog,
+    request_project_access,
+)
 from app.services.project_service import (
     create_project,
     delete_project,
@@ -42,6 +51,26 @@ def _normalize(doc: dict) -> dict:
     return doc
 
 
+def _normalize_catalog(doc: dict) -> dict:
+    if not doc:
+        return doc
+    if "_id" in doc:
+        doc["id"] = str(doc.pop("_id"))
+    return doc
+
+
+def _normalize_access_request(doc: dict) -> dict:
+    if not doc:
+        return doc
+    doc = _json_safe(doc)
+    if "_id" in doc:
+        doc["id"] = doc.pop("_id")
+    doc["project_id"] = str(doc.get("project_id") or "")
+    doc["user_id"] = str(doc.get("user_id") or "")
+    doc["decided_by_user_id"] = str(doc.get("decided_by_user_id") or "") or None
+    return doc
+
+
 @router.get("", response_model=list[ProjectOut])
 async def list_projects_route(
     request: Request,
@@ -67,6 +96,259 @@ async def list_projects_route(
         status=status,
     )
     return [_normalize(doc) for doc in projects]
+
+
+@router.get("/catalog", response_model=list[ProjectCatalogOut])
+async def project_catalog_route(
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    projects = await list_project_catalog(tenant_id=request.state.tenant_id)
+    return [_normalize_catalog(doc) for doc in projects]
+
+
+# NOTE: These /meta/* and /access/* routes intentionally avoid collisions with
+# catch-all "/{project_id}" routes in older deployments where route order could
+# cause static paths like "/catalog" to be interpreted as a project_id.
+@router.get("/meta/catalog", response_model=list[ProjectCatalogOut])
+async def project_catalog_meta_route(
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    projects = await list_project_catalog(tenant_id=request.state.tenant_id)
+    return [_normalize_catalog(doc) for doc in projects]
+
+
+@router.post("/{project_id}/access-requests", response_model=ProjectAccessRequestOut)
+async def request_project_access_route(
+    project_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    try:
+        doc = await request_project_access(
+            tenant_id=request.state.tenant_id,
+            user_id=user.get("user_id"),
+            project_id=project_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    await log_event(
+        tenant_id=request.state.tenant_id,
+        actor_id=user.get("user_id"),
+        action="project_access.requested",
+        entity_type="project",
+        entity_id=project_id,
+    )
+    return _normalize_access_request(doc)
+
+
+@router.post("/access/projects/{project_id}/request", response_model=ProjectAccessRequestOut)
+async def request_project_access_v2_route(
+    project_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    try:
+        doc = await request_project_access(
+            tenant_id=request.state.tenant_id,
+            user_id=user.get("user_id"),
+            project_id=project_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _normalize_access_request(doc)
+
+
+@router.get("/access-requests", response_model=list[ProjectAccessRequestOut])
+async def list_project_access_requests_route(
+    request: Request,
+    _guard=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    docs = await list_access_requests(tenant_id=request.state.tenant_id, status="pending")
+    return [_normalize_access_request(doc) for doc in docs]
+
+
+@router.get("/my-access-requests", response_model=list[ProjectAccessRequestOut])
+async def list_my_project_access_requests_route(
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    docs = await list_my_access_requests(
+        tenant_id=request.state.tenant_id,
+        user_id=user.get("user_id"),
+        status="pending",
+    )
+    return [_normalize_access_request(doc) for doc in docs]
+
+
+@router.get("/access/requests", response_model=list[ProjectAccessRequestOut])
+async def list_project_access_requests_v2_route(
+    request: Request,
+    _guard=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    docs = await list_access_requests(tenant_id=request.state.tenant_id, status="pending")
+    return [_normalize_access_request(doc) for doc in docs]
+
+
+@router.get("/access/my-requests", response_model=list[ProjectAccessRequestOut])
+async def list_my_project_access_requests_v2_route(
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    docs = await list_my_access_requests(
+        tenant_id=request.state.tenant_id,
+        user_id=user.get("user_id"),
+        status="pending",
+    )
+    return [_normalize_access_request(doc) for doc in docs]
+
+
+@router.post("/access-requests/{request_id}/approve", response_model=ProjectAccessRequestOut)
+async def approve_project_access_request_route(
+    request_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        doc = await decide_access_request(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            request_id=request_id,
+            decision="approved",
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    await log_event(
+        tenant_id=request.state.tenant_id,
+        actor_id=user.get("user_id"),
+        action="project_access.approved",
+        entity_type="project_access_request",
+        entity_id=request_id,
+        metadata={"project_id": str(doc.get("project_id") or ""), "user_id": str(doc.get("user_id") or "")},
+    )
+    return _normalize_access_request(doc)
+
+
+@router.post("/access/requests/{request_id}/approve", response_model=ProjectAccessRequestOut)
+async def approve_project_access_request_v2_route(
+    request_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        doc = await decide_access_request(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            request_id=request_id,
+            decision="approved",
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _normalize_access_request(doc)
+
+
+@router.post("/access-requests/{request_id}/reject", response_model=ProjectAccessRequestOut)
+async def reject_project_access_request_route(
+    request_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        doc = await decide_access_request(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            request_id=request_id,
+            decision="rejected",
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    await log_event(
+        tenant_id=request.state.tenant_id,
+        actor_id=user.get("user_id"),
+        action="project_access.rejected",
+        entity_type="project_access_request",
+        entity_id=request_id,
+        metadata={"project_id": str(doc.get("project_id") or ""), "user_id": str(doc.get("user_id") or "")},
+    )
+    return _normalize_access_request(doc)
+
+
+@router.post("/access/requests/{request_id}/reject", response_model=ProjectAccessRequestOut)
+async def reject_project_access_request_v2_route(
+    request_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        doc = await decide_access_request(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            request_id=request_id,
+            decision="rejected",
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _normalize_access_request(doc)
+
+
+@router.post("/{project_id}/invites")
+async def invite_to_project_by_email_route(
+    project_id: str,
+    payload: ProjectInviteByEmail,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        user_id_added, invite_payload = await invite_user_to_project_by_email(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            project_id=project_id,
+            email=str(payload.email),
+            project_role=payload.role,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if user_id_added:
+        await log_event(
+            tenant_id=request.state.tenant_id,
+            actor_id=user.get("user_id"),
+            action="project_member.invited_existing",
+            entity_type="project",
+            entity_id=project_id,
+            metadata={"user_id": user_id_added, "email": str(payload.email), "role": payload.role},
+        )
+        return {"status": "added", "user_id": user_id_added}
+
+    # No org invite created here (email sending is centralized in /orgs invites).
+    # Return the payload needed for the UI to create an org invite with project access attached.
+    await log_event(
+        tenant_id=request.state.tenant_id,
+        actor_id=user.get("user_id"),
+        action="project_member.invited_new",
+        entity_type="project",
+        entity_id=project_id,
+        metadata={"email": str(payload.email), "role": payload.role},
+    )
+    return {"status": "needs_org_invite", "invite": invite_payload}
 
 
 @router.post("", response_model=ProjectOut)

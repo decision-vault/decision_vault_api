@@ -66,3 +66,9 @@ Refresh tokens are stored in a secure, HttpOnly cookie (`dv_refresh`). Access to
 - Refresh tokens expire after 7 days and are rotated on use.
 - Each user belongs to exactly one tenant.
 - Email uniqueness is enforced per tenant.
+
+## Internal Architecture
+
+For a deeper breakdown of packages, concepts, request pipeline, and why specific strategies were chosen, see:
+
+- `docs/ARCHITECTURE.md`

@@ -1,6 +1,19 @@
-from typing import Optional
+from typing import Optional, Any
 
 from pydantic import BaseModel, Field
+
+
+class RequirementsChatMessage(BaseModel):
+    role: str
+    kind: str
+    text: str
+    field_key: Optional[str] = None
+    # Always return ISO strings to keep UI + FastAPI serialization consistent.
+    created_at: Optional[str] = None
+    # Optional action payload for UI (e.g., open a generated doc).
+    action: Optional[dict[str, Any]] = None
+    # Optional metadata (e.g., run_id, token counts, etc.)
+    meta: Optional[dict[str, Any]] = None
 
 
 class ArchitectureDecisions(BaseModel):
@@ -87,3 +100,31 @@ class RequirementsGenerateRequest(BaseModel):
 
 class RequirementsGenerateResponse(BaseModel):
     prd: PRDSchema
+
+
+class RequirementsChatRequest(BaseModel):
+    """
+    Chat-friendly wrapper around requirements intake.
+
+    - Start flow: send `message` only (no `intake_id`)
+    - Respond flow: send `intake_id` + `answers`, or `intake_id` + (`field_key` + `message`)
+    """
+
+    intake_id: Optional[str] = None
+    message: Optional[str] = Field(default=None, max_length=12000)
+    field_key: Optional[str] = None
+    answers: Optional[dict] = None
+
+
+class RequirementsChatResponse(BaseModel):
+    intake_id: str
+    raw_text: Optional[str] = None
+    structured_partial: RequirementsPartial
+    missing_fields: list[str]
+    low_quality_fields: list[str]
+    questions: list[str]
+    question_fields: list[str]
+    answers: Optional[dict] = None
+    chat_messages: list[RequirementsChatMessage] = Field(default_factory=list)
+    ready_for_prd: bool
+    status: str

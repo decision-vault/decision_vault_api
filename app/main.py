@@ -24,6 +24,8 @@ from app.api.requirements import router as requirements_router
 from app.api.messenger import router as messenger_router
 from app.api.prd import router as prd_router
 from app.api.demo import router as demo_router
+from app.api.docs import router as docs_router
+from app.api.generation import router as generation_router
 from app.services.prd_pg_service import ensure_prd_table
 from app.services.llm_usage_service import ensure_usage_table
 from app.services.requirements_service import validate_structured, compute_ready_for_prd
@@ -39,7 +41,7 @@ app = FastAPI(title=settings.app_name)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.(ngrok-free\.app|ngrok-free\.dev|ngrok\.io|ngrok\.app)",
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.(ngrok-free\.app|ngrok-free\.dev|ngrok\.io|ngrok\.app)|https://.*\.vercel\.app|https://.*\.vercel\.com",
     allow_credentials=True,
     allow_methods=settings.cors_allow_methods,
     allow_headers=settings.cors_allow_headers,
@@ -90,6 +92,7 @@ async def startup() -> None:
         )
     await db.licenses.create_index([("tenant_id", 1), ("status", 1), ("expiry_date", 1)])
     await db.project_members.create_index([("tenant_id", 1), ("project_id", 1), ("user_id", 1)], unique=True)
+    await db.project_access_requests.create_index([("tenant_id", 1), ("project_id", 1), ("user_id", 1), ("status", 1)])
     await db.audit_logs.create_index([("tenant_id", 1), ("created_at", -1)])
     await db.stripe_events.create_index("event_id", unique=True)
     await db.slack_installations.create_index("tenant_id", unique=True)
@@ -102,6 +105,8 @@ async def startup() -> None:
     await db.projects.create_index([("tenant_id", 1), ("deleted_at", 1)])
     await db.requirements_intakes.create_index([("tenant_id", 1), ("project_id", 1), ("created_at", -1)])
     await db.requirements_intakes.create_index("status")
+    await db.generation_runs.create_index([("tenant_id", 1), ("project_id", 1), ("status", 1), ("updated_at", -1)])
+    await db.generation_runs.create_index([("tenant_id", 1), ("project_id", 1), ("created_at", -1)])
     # Skip unique index if duplicates exist (first-time boot safety)
     dup_requirements = await db.requirements_intakes.aggregate(
         [
@@ -136,6 +141,9 @@ async def startup() -> None:
     await db.prd_clarifications.create_index([("project_id", 1), ("updated_at", -1)])
     await db.demo_requests.create_index([("created_at", -1)])
     await db.demo_requests.create_index([("email", 1), ("created_at", -1)])
+    await db.org_invites.create_index("token_hash", unique=True)
+    await db.org_invites.create_index([("tenant_id", 1), ("email", 1), ("created_at", -1)])
+    await db.org_invites.create_index("expires_at", expireAfterSeconds=0)
     if settings.enable_rate_limiter:
         try:
             redis_client = redis.from_url(settings.redis_url)
@@ -196,6 +204,8 @@ app.include_router(hf_inference_router)
 app.include_router(requirements_router)
 app.include_router(messenger_router)
 app.include_router(prd_router)
+app.include_router(docs_router)
+app.include_router(generation_router)
 app.include_router(demo_router)
 
 

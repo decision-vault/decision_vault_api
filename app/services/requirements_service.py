@@ -255,13 +255,14 @@ async def answer_collector(state: RequirementsState) -> RequirementsState:
 async def complete_check(state: RequirementsState) -> RequirementsState:
     sanitized = _sanitize_structured(state["structured"])
     missing, low_quality = validate_structured(sanitized)
-    questions = build_questions(sorted(set(missing + low_quality)))
+    question_fields = sorted(set(missing + low_quality))
+    questions = build_questions(question_fields)
     return {
         **state,
         "structured": sanitized,
         "missing_fields": missing,
         "low_quality_fields": low_quality,
-        "questions": sorted(set(questions)),
+        "questions": questions,
     }
 
 
@@ -323,15 +324,64 @@ async def start_intake(tenant_id: str, project_id: str, raw_text: str) -> dict:
         "prd": None,
     }
     result = await graph.ainvoke(state)
+    missing_fields = result.get("missing_fields") or []
+    low_quality_fields = result.get("low_quality_fields", []) or []
+    # Preserve ordering: missing first, then low-quality. Ask one question at a time in chat.
+    question_fields_all = [*missing_fields, *low_quality_fields]
+    questions_all = result.get("questions") or build_questions(question_fields_all)
+    current_question_fields = question_fields_all[:1]
+    current_questions = questions_all[:1]
+
+    chat_messages: list[dict] = []
+    now = _utcnow()
+    if raw_text:
+        chat_messages.append(
+            {
+                "role": "user",
+                "kind": "intake",
+                "text": raw_text,
+                "field_key": None,
+                "created_at": now,
+            }
+        )
+    # Ask only the next question in chat (avoid dumping all questions at once).
+    if current_questions:
+        q = current_questions[0]
+        fk = current_question_fields[0] if current_question_fields else None
+        chat_messages.append(
+            {
+                "role": "assistant",
+                "kind": "question",
+                "text": q,
+                "field_key": fk,
+                "created_at": now,
+            }
+        )
+
+    ready_for_prd = compute_ready_for_prd(result["structured"], missing_fields, low_quality_fields)
+    if ready_for_prd:
+        chat_messages.append(
+            {
+                "role": "assistant",
+                "kind": "status",
+                "text": "Requirements captured. You can start generating documents.",
+                "field_key": None,
+                "created_at": now,
+            }
+        )
     intake = {
         "tenant_id": ObjectId(tenant_id),
         "project_id": ObjectId(project_id),
         "raw_text": raw_text,
         "structured": result["structured"],
-        "questions": result["questions"],
-        "missing_fields": result["missing_fields"],
-        "low_quality_fields": result.get("low_quality_fields", []),
-        "status": "needs_info" if result["missing_fields"] or result.get("low_quality_fields") else "ready",
+        # Only the next question is exposed to the UI; the full state is tracked via missing_fields/low_quality_fields.
+        "questions": current_questions,
+        "question_fields": current_question_fields,
+        "missing_fields": missing_fields,
+        "low_quality_fields": low_quality_fields,
+        "answers": {},
+        "chat_messages": chat_messages,
+        "status": "ready" if ready_for_prd else "needs_info",
         "created_at": _utcnow(),
         "updated_at": _utcnow(),
         "version": 1,
@@ -365,8 +415,11 @@ async def start_intake(tenant_id: str, project_id: str, raw_text: str) -> dict:
                     "raw_text": raw_text,
                     "structured": intake["structured"],
                     "questions": intake["questions"],
+                    "question_fields": intake["question_fields"],
                     "missing_fields": intake["missing_fields"],
                     "low_quality_fields": intake["low_quality_fields"],
+                    "answers": intake["answers"],
+                    "chat_messages": intake["chat_messages"],
                     "status": intake["status"],
                     "updated_at": _utcnow(),
                     "version": version,
@@ -395,10 +448,16 @@ async def start_intake(tenant_id: str, project_id: str, raw_text: str) -> dict:
         )
     return {
         "intake_id": intake_id,
+        "raw_text": raw_text,
         "structured_partial": result["structured"],
-        "missing_fields": result["missing_fields"],
-        "low_quality_fields": result.get("low_quality_fields", []),
-        "questions": result["questions"],
+        "missing_fields": missing_fields,
+        "low_quality_fields": low_quality_fields,
+        "questions": current_questions,
+        "question_fields": current_question_fields,
+        "answers": {},
+        "chat_messages": chat_messages,
+        "ready_for_prd": ready_for_prd,
+        "status": "ready" if ready_for_prd else "needs_info",
     }
 
 
@@ -407,11 +466,18 @@ async def respond_intake(intake_id: str, answers: dict) -> dict:
     intake = await db.requirements_intakes.find_one({"_id": ObjectId(intake_id)})
     if not intake:
         raise ValueError("Intake not found")
+    existing_answers = intake.get("answers") or {}
+    merged_answers = dict(existing_answers)
+    incoming_answers = answers or {}
+    for k, v in (incoming_answers or {}).items():
+        if v is None:
+            continue
+        merged_answers[str(k)] = v
     graph = build_respond_graph()
     state: RequirementsState = {
         "raw_text": intake.get("raw_text"),
         "structured": intake.get("structured", {}),
-        "answers": answers,
+        "answers": merged_answers,
         "questions": [],
         "missing_fields": [],
         "low_quality_fields": [],
@@ -419,6 +485,71 @@ async def respond_intake(intake_id: str, answers: dict) -> dict:
     }
     result = await graph.ainvoke(state)
     status = "needs_info" if result["missing_fields"] or result.get("low_quality_fields") else "ready"
+    missing_fields = result.get("missing_fields") or []
+    low_quality_fields = result.get("low_quality_fields", []) or []
+    question_fields_all = [*missing_fields, *low_quality_fields]
+    questions_all = result.get("questions") or build_questions(question_fields_all)
+
+    # Next question (one at a time)
+    current_question_fields = question_fields_all[:1]
+    current_questions = questions_all[:1]
+
+    # Persist chat messages so refresh can rebuild the conversation.
+    chat_messages: list[dict] = list(intake.get("chat_messages") or [])
+    # Keep asked_fields for possible future enhancements (avoid repeats), but we still ask only the current next question.
+    asked_fields = {
+        m.get("field_key")
+        for m in chat_messages
+        if isinstance(m, dict) and m.get("kind") == "question" and m.get("field_key")
+    }
+    now = _utcnow()
+
+    # Append user answers for newly provided/changed fields.
+    for k, v in merged_answers.items():
+        if existing_answers.get(k) == v:
+            continue
+        chat_messages.append(
+            {
+                "role": "user",
+                "kind": "answer",
+                "text": str(v),
+                "field_key": k,
+                "created_at": now,
+            }
+        )
+
+    # Append only the next question (avoid dumping all at once).
+    if current_questions:
+        fk = current_question_fields[0] if current_question_fields else None
+        q = current_questions[0]
+        if fk and fk in asked_fields and fk in low_quality_fields:
+            # If we're re-asking for low quality, keep the question but still append it as a new turn.
+            pass
+        if q:
+            chat_messages.append(
+                {
+                    "role": "assistant",
+                    "kind": "question",
+                    "text": q,
+                    "field_key": fk,
+                    "created_at": now,
+                }
+            )
+
+    ready_for_prd = compute_ready_for_prd(result["structured"], missing_fields, low_quality_fields)
+    if ready_for_prd:
+        last = chat_messages[-1] if chat_messages else None
+        if not (isinstance(last, dict) and last.get("kind") == "status"):
+            chat_messages.append(
+                {
+                    "role": "assistant",
+                    "kind": "status",
+                    "text": "Requirements captured. You can start generating documents.",
+                    "field_key": None,
+                    "created_at": now,
+                }
+            )
+
     last = await db.requirements_history.find_one(
         {"tenant_id": intake["tenant_id"], "project_id": intake["project_id"]},
         sort=[("version", -1)],
@@ -429,9 +560,12 @@ async def respond_intake(intake_id: str, answers: dict) -> dict:
         {
             "$set": {
                 "structured": result["structured"],
-                "questions": result["questions"],
-                "missing_fields": result["missing_fields"],
-                "low_quality_fields": result.get("low_quality_fields", []),
+                "questions": current_questions,
+                "question_fields": current_question_fields,
+                "missing_fields": missing_fields,
+                "low_quality_fields": low_quality_fields,
+                "answers": merged_answers,
+                "chat_messages": chat_messages,
                 "status": status,
                 "updated_at": _utcnow(),
                 "version": version,
@@ -450,12 +584,14 @@ async def respond_intake(intake_id: str, answers: dict) -> dict:
     )
     return {
         "structured_partial": result["structured"],
-        "missing_fields": result["missing_fields"],
-        "low_quality_fields": result.get("low_quality_fields", []),
-        "questions": result["questions"],
-        "ready_for_prd": compute_ready_for_prd(
-            result["structured"], result["missing_fields"], result.get("low_quality_fields", [])
-        ),
+        "missing_fields": missing_fields,
+        "low_quality_fields": low_quality_fields,
+        "questions": current_questions,
+        "question_fields": current_question_fields,
+        "answers": merged_answers,
+        "chat_messages": chat_messages,
+        "ready_for_prd": ready_for_prd,
+        "status": "ready" if ready_for_prd else "needs_info",
     }
 
 

@@ -17,8 +17,13 @@ from app.middleware.auth import get_current_user
 def _forbidden(detail: str = "Forbidden") -> HTTPException:
     return HTTPException(status_code=403, detail=detail)
 
+def _bad_request(detail: str = "Bad request") -> HTTPException:
+    return HTTPException(status_code=400, detail=detail)
+
 
 def _oid(value: str) -> ObjectId:
+    if not value or not ObjectId.is_valid(value):
+        raise _bad_request("Invalid id")
     return ObjectId(value)
 
 

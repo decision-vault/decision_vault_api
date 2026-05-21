@@ -2,7 +2,7 @@ from typing import Literal, Union
 import logging
 import httpx
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 import re
 from pathlib import Path
@@ -45,10 +45,26 @@ RUN_STALE_TIMEOUT_SECONDS = 120
 _ACTIVE_PRD_TASKS: set[asyncio.Task] = set()
 _ACTIVE_PRD_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
 PRD_STAGE_SEQUENCE = [
-    "stage_1_core_context",
-    "stage_2_scope_user_stories",
-    "stage_3_architecture",
-    "stage_4_delivery_quality",
+    "stage_01_context_snapshot",
+    "stage_02_intro_summary",
+    "stage_03_doc_metadata",
+    "stage_04_intro_problem_context",
+    "stage_05_intro_why_build",
+    "stage_06_intro_strategy_okrs",
+    "stage_07_goals_primary",
+    "stage_08_goals_kpis",
+    "stage_09_goals_done_criteria",
+    "stage_10_users_types",
+    "stage_11_users_personas",
+    "stage_12_users_market_optional",
+    "stage_13_scope_in",
+    "stage_14_scope_out",
+    "stage_15_scope_assumptions",
+    "stage_16_features_user_stories",
+    "stage_17_architecture_data_api_integrations",
+    "stage_18_ux_design",
+    "stage_19_delivery_quality",
+    "stage_20_finalize",
 ]
 
 
@@ -367,12 +383,19 @@ def _as_aware_dt(value) -> datetime | None:
 def _prd_steps_are_complete(steps: list[dict] | None) -> bool:
     if not isinstance(steps, list):
         return False
-    completed = {
-        str(step.get("stage")): str(step.get("status") or "").lower()
-        for step in steps
-        if isinstance(step, dict) and step.get("stage")
-    }
-    return all(completed.get(stage) == "completed" for stage in PRD_STAGE_SEQUENCE)
+    # Steps historically could contain duplicates per stage (e.g., multiple "running"
+    # events pushed for the same stage). Treat a stage as complete if *any* matching
+    # step has status "completed".
+    statuses_by_stage: dict[str, set[str]] = {}
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        stg = step.get("stage")
+        if not stg:
+            continue
+        key = str(stg)
+        statuses_by_stage.setdefault(key, set()).add(str(step.get("status") or "").lower())
+    return all("completed" in statuses_by_stage.get(stage, set()) for stage in PRD_STAGE_SEQUENCE)
 
 
 def _apply_prd_version_label(markdown: str, version_number: int | str | None) -> str:
@@ -613,42 +636,266 @@ async def _append_run_event(run_id: ObjectId, event: dict) -> None:
             {"_id": run_id, "started_at": None},
             {"$set": {"started_at": now}},
         )
-        await db.prd_runs.update_one(
-            {"_id": run_id},
+        # Do not push duplicate step rows for the same stage; update the existing step if present.
+        res = await db.prd_runs.update_one(
+            {"_id": run_id, "steps": {"$elemMatch": {"stage": stage, "status": {"$ne": "completed"}}}},
             {
                 "$set": {
                     "status": "running",
                     "updated_at": now,
-                },
-                "$push": {
-                    "events": {"at": now, **event},
-                    "steps": {
-                        "stage": stage,
-                        "status": "running",
-                        "started_at": now,
-                    },
-                },
-            },
-        )
-        return
-
-    if status in {"completed", "failed"}:
-        await db.prd_runs.update_one(
-            {"_id": run_id, "steps.stage": stage},
-            {
-                "$set": {
-                    "updated_at": now,
-                    "steps.$.status": status,
-                    "steps.$.ended_at": now,
-                    "steps.$.input_tokens": event.get("input_tokens"),
-                    "steps.$.output_tokens": event.get("output_tokens"),
-                    "steps.$.retry_count": event.get("retry_count", 0),
-                    "steps.$.error": event.get("error"),
-                    "steps.$.stage_output": event.get("stage_output"),
+                    "steps.$.status": "running",
+                    # Preserve existing steps.$.started_at (we don't overwrite it here on resume).
                 },
                 "$push": {"events": {"at": now, **event}},
             },
         )
+        if res.matched_count == 0:
+            # If the stage is already completed, do not create a new step row for it.
+            already_completed = await db.prd_runs.find_one(
+                {"_id": run_id, "steps": {"$elemMatch": {"stage": stage, "status": "completed"}}},
+                {"_id": 1},
+            )
+            if already_completed:
+                await db.prd_runs.update_one(
+                    {"_id": run_id},
+                    {"$set": {"status": "running", "updated_at": now}, "$push": {"events": {"at": now, **event}}},
+                )
+                return
+            await db.prd_runs.update_one(
+                {"_id": run_id},
+                {
+                    "$set": {"status": "running", "updated_at": now},
+                    "$push": {
+                        "events": {"at": now, **event},
+                        "steps": {"stage": stage, "status": "running", "started_at": now},
+                    },
+                },
+            )
+        return
+
+    if status == "clarification_required":
+        # Pause the run and persist a clarification payload so the UI can collect missing info.
+        missing_fields = event.get("missing_fields") or []
+        questions = event.get("questions") or []
+        answer_keys = event.get("answer_keys") or []
+        res = await db.prd_runs.update_one(
+            {"_id": run_id, "steps.stage": stage},
+            {
+                "$set": {
+                    "status": "clarification_required",
+                    "pause_requested": True,
+                    "updated_at": now,
+                    "clarification": {
+                        "stage": stage,
+                        "missing_fields": missing_fields,
+                        "questions": questions,
+                        "answer_keys": answer_keys,
+                        "requested_at": now,
+                    },
+                    "steps.$[s].status": "clarification_required",
+                    "steps.$[s].error": None,
+                },
+                "$push": {"events": {"at": now, **event}},
+            },
+            array_filters=[{"s.stage": stage}],
+        )
+        if res.matched_count == 0:
+            await db.prd_runs.update_one(
+                {"_id": run_id},
+                {
+                    "$set": {
+                        "status": "clarification_required",
+                        "pause_requested": True,
+                        "updated_at": now,
+                        "clarification": {
+                            "stage": stage,
+                            "missing_fields": missing_fields,
+                            "questions": questions,
+                            "answer_keys": answer_keys,
+                            "requested_at": now,
+                        },
+                    },
+                    "$push": {
+                        "events": {"at": now, **event},
+                        "steps": {
+                            "stage": stage,
+                            "status": "clarification_required",
+                            "started_at": now,
+                        },
+                    },
+                },
+            )
+        # Also store the latest partial markdown so the doc viewer keeps updating.
+        partial_markdown = event.get("partial_markdown")
+        if isinstance(partial_markdown, str) and partial_markdown.strip():
+            await db.prd_runs.update_one(
+                {"_id": run_id},
+                {
+                    "$set": {
+                        "partial_result": {
+                            "stage": stage,
+                            "prd_markdown": partial_markdown,
+                            "updated_at": now,
+                        }
+                    }
+                },
+            )
+
+        # Best-effort: append clarification question into the requirements intake chat thread.
+        try:
+            run_doc = await db.prd_runs.find_one(
+                {"_id": run_id},
+                {"tenant_id": 1, "project_id": 1, "intake_id": 1, "clarification_answers": 1},
+            )
+            intake_id = (run_doc or {}).get("intake_id")
+            if intake_id:
+                now_iso = now.isoformat()
+                q_items = questions if isinstance(questions, list) else []
+                k_items = answer_keys if isinstance(answer_keys, list) else []
+                # If we already have answers for the requested key(s), do not append duplicate questions to chat.
+                try:
+                    existing_answers = run_doc.get("clarification_answers") if isinstance(run_doc, dict) else {}
+                    existing_answers = existing_answers if isinstance(existing_answers, dict) else {}
+                    answered_all = True
+                    for k in (k_items or [])[:1]:
+                        kk = str(k or "").strip()
+                        if not kk:
+                            continue
+                        if not (isinstance(existing_answers.get(kk), str) and str(existing_answers.get(kk)).strip()):
+                            answered_all = False
+                            break
+                    if answered_all and k_items:
+                        return
+                except Exception:
+                    pass
+                chat_push: list[dict] = [
+                    {
+                        "role": "assistant",
+                        "kind": "status",
+                        "text": "PRD: Clarification required. Answer in chat to resume generation.",
+                        "field_key": None,
+                        "created_at": now_iso,
+                        "meta": {"run_kind": "prd", "run_id": str(run_id), "stage": stage},
+                    }
+                ]
+                for idx, q in enumerate(q_items):
+                    q_text = str(q or "").strip()
+                    if not q_text:
+                        continue
+                    field_key = str(k_items[idx] if idx < len(k_items) else "").strip() or None
+                    created_at = (now + timedelta(microseconds=idx + 1)).isoformat()
+                    chat_push.append(
+                        {
+                            "role": "assistant",
+                            "kind": "question",
+                            "text": q_text,
+                            "field_key": field_key,
+                            "created_at": created_at,
+                            "meta": {"run_kind": "prd", "run_id": str(run_id), "stage": stage},
+                        }
+                    )
+                if chat_push:
+                    # Use _id to locate the intake, but still verify tenant/project before writing.
+                    intake_doc = await db.requirements_intakes.find_one(
+                        {"_id": intake_id},
+                        {"tenant_id": 1, "project_id": 1, "chat_messages": {"$slice": -30}},
+                    )
+                    if intake_doc and intake_doc.get("tenant_id") == run_doc.get("tenant_id") and intake_doc.get("project_id") == run_doc.get("project_id"):
+                        # De-dupe: if the latest question for this run+stage+field_key already exists, don't push again.
+                        try:
+                            existing = intake_doc.get("chat_messages") if isinstance(intake_doc, dict) else []
+                            existing = existing if isinstance(existing, list) else []
+                            first_q = None
+                            for it in chat_push:
+                                if isinstance(it, dict) and it.get("kind") == "question":
+                                    first_q = it
+                                    break
+                            if first_q:
+                                fk = str(first_q.get("field_key") or "").strip()
+                                qt = str(first_q.get("text") or "").strip()
+                                for m in existing:
+                                    if not isinstance(m, dict):
+                                        continue
+                                    if str(m.get("role") or "") != "assistant":
+                                        continue
+                                    if str(m.get("kind") or "") != "question":
+                                        continue
+                                    if str(m.get("field_key") or "").strip() != fk:
+                                        continue
+                                    meta = m.get("meta") or {}
+                                    if not isinstance(meta, dict):
+                                        continue
+                                    if str(meta.get("run_id") or "") != str(run_id):
+                                        continue
+                                    if str(meta.get("stage") or "") != stage:
+                                        continue
+                                    if str(m.get("text") or "").strip() == qt:
+                                        return
+                        except Exception:
+                            pass
+                        await db.requirements_intakes.update_one(
+                            {"_id": intake_id},
+                            {"$push": {"chat_messages": {"$each": chat_push}}, "$set": {"updated_at": now}},
+                        )
+        except Exception:
+            pass
+        return
+
+    if status in {"completed", "failed"}:
+        res = await db.prd_runs.update_one(
+            {"_id": run_id, "steps.stage": stage},
+            {
+                "$set": {
+                    "updated_at": now,
+                    "steps.$[s].status": status,
+                    "steps.$[s].ended_at": now,
+                    "steps.$[s].input_tokens": event.get("input_tokens"),
+                    "steps.$[s].output_tokens": event.get("output_tokens"),
+                    "steps.$[s].retry_count": event.get("retry_count", 0),
+                    "steps.$[s].error": event.get("error"),
+                    "steps.$[s].stage_output": event.get("stage_output"),
+                    "steps.$[s].stage_output_full": event.get("stage_output_full"),
+                },
+                "$push": {"events": {"at": now, **event}},
+            },
+            array_filters=[{"s.stage": stage}],
+        )
+        if res.matched_count == 0:
+            await db.prd_runs.update_one(
+                {"_id": run_id},
+                {
+                    "$set": {"updated_at": now},
+                    "$push": {
+                        "events": {"at": now, **event},
+                        "steps": {
+                            "stage": stage,
+                            "status": status,
+                            "started_at": now,
+                            "ended_at": now,
+                            "input_tokens": event.get("input_tokens"),
+                            "output_tokens": event.get("output_tokens"),
+                            "retry_count": event.get("retry_count", 0),
+                            "error": event.get("error"),
+                            "stage_output": event.get("stage_output"),
+                            "stage_output_full": event.get("stage_output_full"),
+                        },
+                    },
+                },
+            )
+        partial_markdown = event.get("partial_markdown")
+        if status == "completed" and isinstance(partial_markdown, str) and partial_markdown.strip():
+            await db.prd_runs.update_one(
+                {"_id": run_id},
+                {
+                    "$set": {
+                        "partial_result": {
+                            "stage": stage,
+                            "prd_markdown": partial_markdown,
+                            "updated_at": now,
+                        }
+                    }
+                },
+            )
         return
 
     await db.prd_runs.update_one(
@@ -659,12 +906,17 @@ async def _append_run_event(run_id: ObjectId, event: dict) -> None:
 
 async def _get_run_controls(run_id: ObjectId) -> dict[str, bool]:
     db = get_db()
-    doc = await db.prd_runs.find_one({"_id": run_id}, {"pause_requested": 1, "stop_requested": 1})
+    doc = await db.prd_runs.find_one(
+        {"_id": run_id},
+        {"pause_requested": 1, "stop_requested": 1, "clarification_answers": 1, "clarification": 1},
+    )
     if not doc:
         return {"pause": False, "stop": True}
     return {
         "pause": bool(doc.get("pause_requested")),
         "stop": bool(doc.get("stop_requested")),
+        "clarification_answers": doc.get("clarification_answers") or {},
+        "clarification": doc.get("clarification") or None,
     }
 
 
@@ -674,16 +926,40 @@ async def _run_prd_job(
     project_id: str,
     tenant_id: str,
     created_by: str,
+    intake_id: str | None,
+    resume_from_stage: str | None = None,
 ) -> None:
     db = get_db()
     try:
+        stage_cache = None
+        if resume_from_stage:
+            try:
+                run_doc = await db.prd_runs.find_one({"_id": run_id}, {"steps": 1})
+                steps = (run_doc or {}).get("steps") or []
+                cache: dict[str, dict] = {}
+                if isinstance(steps, list):
+                    for s in steps:
+                        if not isinstance(s, dict):
+                            continue
+                        if str(s.get("status") or "").lower() != "completed":
+                            continue
+                        stg = str(s.get("stage") or "").strip()
+                        full = s.get("stage_output_full")
+                        if stg and isinstance(full, dict) and full:
+                            cache[stg] = full
+                stage_cache = cache or None
+            except Exception:
+                stage_cache = None
         result = await generate_multistep_prd(
             payload,
             tenant_id=tenant_id,
             project_id=project_id,
+            intake_id=intake_id,
             run_id=str(run_id),
             progress_cb=lambda ev: _append_run_event(run_id, ev),
             control_cb=lambda: _get_run_controls(run_id),
+            resume_from_stage=resume_from_stage,
+            stage_cache=stage_cache,
         )
         stored = await store_prd_version(
             project_id=project_id,
@@ -698,7 +974,29 @@ async def _run_prd_job(
                 break
             await asyncio.sleep(0.2)
         if not steps_complete:
-            raise ValueError("PRD run finished content generation but not all stages were recorded as completed.")
+            # Do not fail a successful PRD generation due to run-tracking bookkeeping.
+            logger.warning(
+                "prd_run_steps_incomplete_but_content_ready run_id=%s project_id=%s",
+                str(run_id),
+                project_id,
+            )
+            try:
+                await db.prd_runs.update_one(
+                    {"_id": run_id},
+                    {
+                        "$set": {"updated_at": _utcnow()},
+                        "$push": {
+                            "events": {
+                                "at": _utcnow(),
+                                "status": "warning",
+                                "stage": None,
+                                "error": "Content generation succeeded but not all stage steps were marked completed.",
+                            }
+                        },
+                    },
+                )
+            except Exception:
+                pass
         await db.prd_runs.update_one(
             {"_id": run_id},
             {
@@ -707,18 +1005,83 @@ async def _run_prd_job(
                     "updated_at": _utcnow(),
                     "completed_at": _utcnow(),
                     "result": {
+                        "notification": 'PRD is ready. Click "View doc" to preview.',
+                        "doc": {
+                            "kind": "prd",
+                            "doc_id": stored.get("doc_id"),
+                            "version": stored.get("version_number"),
+                        },
                         "pages_estimated": result.pages_estimated,
                         "sections_generated": result.sections_generated,
                         "required_sections": result.required_sections,
                         "missing_sections": result.missing_sections,
                         "has_all_required_sections": result.has_all_required_sections,
                         "total_tokens_used": result.total_tokens_used,
-                        "prd_markdown": result.prd_markdown,
                         "version": stored.get("version_number"),
                     },
                 }
             },
         )
+
+        # Best-effort: append completion + generation log to the requirements intake chat thread.
+        if intake_id:
+            try:
+                now_iso = _utcnow().isoformat()
+                tenant_oid = _as_oid(tenant_id, "tenant_id")
+                project_oid = _as_oid(project_id, "project_id")
+                intake_oid = _as_oid(intake_id, "intake_id")
+
+                run_doc = await db.prd_runs.find_one({"_id": run_id}, {"steps": 1, "result": 1})
+                steps = (run_doc or {}).get("steps") or []
+                log_lines: list[str] = []
+                if isinstance(steps, list):
+                    for s in steps:
+                        if not isinstance(s, dict):
+                            continue
+                        st = str(s.get("stage") or "").strip()
+                        ss = str(s.get("status") or "").strip()
+                        it = s.get("input_tokens")
+                        ot = s.get("output_tokens")
+                        if st:
+                            tok = f" (in={it}, out={ot})" if (it is not None or ot is not None) else ""
+                            log_lines.append(f"- {st}: {ss}{tok}")
+                log_text = "Generation log:\n" + ("\n".join(log_lines) if log_lines else "- Insufficient information provided.")
+
+                await db.requirements_intakes.update_one(
+                    {"_id": intake_oid, "tenant_id": tenant_oid, "project_id": project_oid},
+                    {
+                        "$push": {
+                            "chat_messages": {
+                                "$each": [
+                                    {
+                                        "role": "assistant",
+                                        "kind": "status",
+                                        "text": 'PRD is ready. Click "View doc" to preview.',
+                                        "field_key": None,
+                                        "created_at": now_iso,
+                                        "action": {"type": "open_doc", "kind": "prd", "docId": stored.get("doc_id")},
+                                        "meta": {
+                                            "run_id": str(run_id),
+                                            "version": stored.get("version_number"),
+                                            "total_tokens_used": result.total_tokens_used,
+                                        },
+                                    },
+                                    {
+                                        "role": "assistant",
+                                        "kind": "log",
+                                        "text": log_text,
+                                        "field_key": None,
+                                        "created_at": now_iso,
+                                        "meta": {"run_id": str(run_id)},
+                                    },
+                                ]
+                            }
+                        },
+                        "$set": {"updated_at": _utcnow()},
+                    },
+                )
+            except Exception:
+                pass
     except RuntimeError as exc:
         # User-initiated stop path.
         await db.prd_runs.update_one(
@@ -772,10 +1135,28 @@ async def _enqueue_prd_run(
     db = get_db()
     run_id = ObjectId()
     now = _utcnow()
+    # Carry forward prior clarification answers for this project/user so we don't ask the same questions again.
+    prior_answers: dict | None = None
+    try:
+        prior = await db.prd_runs.find_one(
+            {
+                "tenant_id": _as_oid(tenant_id, "tenant_id"),
+                "project_id": _as_oid(project_id, "project_id"),
+                "created_by": created_by,
+                "clarification_answers": {"$exists": True, "$ne": {}},
+            },
+            {"clarification_answers": 1},
+            sort=[("created_at", -1)],
+        )
+        if prior and isinstance(prior.get("clarification_answers"), dict):
+            prior_answers = prior.get("clarification_answers")
+    except Exception:
+        prior_answers = None
     run_doc = {
         "_id": run_id,
         "tenant_id": _as_oid(tenant_id, "tenant_id"),
         "project_id": _as_oid(project_id, "project_id"),
+        "intake_id": _as_oid(payload.intake_id, "intake_id") if getattr(payload, "intake_id", None) else None,
         "created_by": created_by,
         "status": "queued",
         "request": payload.model_dump(),
@@ -785,6 +1166,8 @@ async def _enqueue_prd_run(
         "result": None,
         "pause_requested": False,
         "stop_requested": False,
+        "clarification_answers": prior_answers or {},
+        "clarification": None,
         "created_at": now,
         "updated_at": now,
         "started_at": None,
@@ -798,6 +1181,8 @@ async def _enqueue_prd_run(
             project_id=project_id,
             tenant_id=tenant_id,
             created_by=created_by,
+            intake_id=getattr(payload, "intake_id", None),
+            resume_from_stage=None,
         )
     )
     _ACTIVE_PRD_TASKS.add(task)
@@ -991,7 +1376,15 @@ async def get_prd_run_status(
         run_status = doc.get("status")
 
     steps = doc.get("steps", [])
-    has_final_result = isinstance(doc.get("result"), dict) and bool((doc.get("result") or {}).get("prd_markdown"))
+    result_obj = doc.get("result") or {}
+    has_final_result = False
+    if isinstance(result_obj, dict):
+        # New shape: result.doc.doc_id (preferred) or result.version.
+        doc_ref = result_obj.get("doc") or {}
+        if isinstance(doc_ref, dict) and str(doc_ref.get("doc_id") or "").strip():
+            has_final_result = True
+        elif result_obj.get("version") is not None:
+            has_final_result = True
     if run_status == "completed" and (not has_final_result or not _prd_steps_are_complete(steps)):
         corrected_status = "running" if _as_aware_dt(doc.get("started_at")) else "queued"
         await db.prd_runs.update_one(
@@ -1037,6 +1430,8 @@ async def get_prd_run_status(
         "steps": step_timings,
         "error": doc.get("error"),
         "result": doc.get("result"),
+        "partial_result": doc.get("partial_result"),
+        "clarification": doc.get("clarification"),
         "timing": {
             "total_elapsed_seconds": total_elapsed_seconds,
         },
@@ -1045,6 +1440,159 @@ async def get_prd_run_status(
         "started_at": doc.get("started_at"),
         "completed_at": doc.get("completed_at"),
     }
+
+
+@router.post("/runs/{run_id}/clarification/respond")
+async def respond_prd_run_clarification(
+    run_id: str,
+    payload: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    """
+    Submit clarification answers for a paused PRD run and resume it.
+    The run worker will pick up answers via control_cb and re-run the stage that requested clarification.
+    """
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+
+    db = get_db()
+    run_oid = _as_oid(run_id, "run_id")
+    doc = await db.prd_runs.find_one(
+        {
+            "_id": run_oid,
+            "tenant_id": _as_oid(user.get("tenant_id"), "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+        },
+        {"clarification": 1, "clarification_answers": 1, "intake_id": 1, "tenant_id": 1, "project_id": 1},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    message = str((payload or {}).get("message") or "").strip()
+    answers_in = (payload or {}).get("answers")
+    answers: dict[str, str] = {}
+    if isinstance(answers_in, dict):
+        for k, v in answers_in.items():
+            k2 = str(k or "").strip()
+            v2 = str(v or "").strip()
+            if k2 and v2:
+                answers[k2] = v2
+
+    clarification = doc.get("clarification") or {}
+    stage = str((clarification or {}).get("stage") or "").strip()
+    answer_keys = clarification.get("answer_keys") or []
+    if message and stage and isinstance(answer_keys, list) and answer_keys:
+        # Most stages ask one clarification at a time; bind message to the first requested key.
+        k2 = str(answer_keys[0] or "").strip()
+        if k2:
+            answers.setdefault(k2, message)
+
+    if not answers:
+        raise HTTPException(status_code=400, detail="answers or message is required")
+
+    merged_answers = dict(doc.get("clarification_answers") or {})
+    merged_answers.update(answers)
+    now = _utcnow()
+    await db.prd_runs.update_one(
+        {"_id": run_oid},
+        {
+            "$set": {
+                "clarification_answers": merged_answers,
+                "pause_requested": False,
+                "status": "running",
+                "updated_at": now,
+                "clarification_resolved_at": now,
+                "clarification": None,
+            }
+        },
+    )
+
+    # Best-effort: append answer + resume note into intake chat_messages.
+    try:
+        intake_id = doc.get("intake_id")
+        if intake_id:
+            now_iso = now.isoformat()
+            push_items: list[dict] = []
+            if message:
+                fk = None
+                try:
+                    if isinstance(answer_keys, list) and len(answer_keys) == 1 and str(answer_keys[0] or "").strip():
+                        fk = str(answer_keys[0]).strip()
+                except Exception:
+                    fk = None
+                push_items.append(
+                    {"role": "user", "kind": "answer", "text": message, "field_key": fk, "created_at": now_iso, "meta": {"run_kind": "prd", "run_id": run_id}}
+                )
+            else:
+                for k, v in answers.items():
+                    push_items.append(
+                        {"role": "user", "kind": "answer", "text": f"{k}: {v}", "field_key": k, "created_at": now_iso, "meta": {"run_kind": "prd", "run_id": run_id}}
+                    )
+            push_items.append(
+                {
+                    "role": "assistant",
+                    "kind": "status",
+                    "text": "Thanks. Resuming PRD generation.",
+                    "field_key": None,
+                    "created_at": now_iso,
+                    "meta": {"run_kind": "prd", "run_id": run_id},
+                }
+            )
+            intake_doc = await db.requirements_intakes.find_one({"_id": intake_id}, {"tenant_id": 1, "project_id": 1})
+            if intake_doc and intake_doc.get("tenant_id") == doc.get("tenant_id") and intake_doc.get("project_id") == doc.get("project_id"):
+                await db.requirements_intakes.update_one(
+                    {"_id": intake_id},
+                    {"$push": {"chat_messages": {"$each": push_items}}, "$set": {"updated_at": now}},
+                )
+    except Exception:
+        pass
+
+    # Return updated chat thread so the UI can render the question/answer immediately without another round trip.
+    chat_messages = None
+    try:
+        intake_id = doc.get("intake_id")
+        if intake_id:
+            intake_doc = await db.requirements_intakes.find_one(
+                {"_id": intake_id},
+                {"tenant_id": 1, "project_id": 1, "chat_messages": 1},
+            )
+            if (
+                intake_doc
+                and intake_doc.get("tenant_id") == doc.get("tenant_id")
+                and intake_doc.get("project_id") == doc.get("project_id")
+                and isinstance(intake_doc.get("chat_messages"), list)
+            ):
+                chat_messages = intake_doc.get("chat_messages")
+                # Ensure created_at values are JSON-safe.
+                normalized: list[dict] = []
+                for m in chat_messages:
+                    if not isinstance(m, dict):
+                        continue
+                    created_at = m.get("created_at")
+                    if isinstance(created_at, datetime):
+                        created_at = created_at.isoformat()
+                    elif created_at is not None and not isinstance(created_at, str):
+                        created_at = str(created_at)
+                    normalized.append({**m, "created_at": created_at})
+                chat_messages = normalized
+    except Exception:
+        chat_messages = None
+
+    question = None
+    try:
+        qs = (clarification or {}).get("questions") or []
+        if isinstance(qs, list) and qs:
+            question = str(qs[0] or "").strip() or None
+    except Exception:
+        question = None
+
+    resp = {"status": "running"}
+    if question:
+        resp["question"] = question
+    if chat_messages is not None:
+        resp["chat_messages"] = chat_messages
+    return resp
 
 
 @router.post("/runs/{run_id}/pause")
@@ -1157,6 +1705,103 @@ async def stop_prd_run(
         task.cancel()
     await _append_run_event(oid, {"stage": "run", "status": "stopped", "error": "Run stopped by user."})
     return {"run_id": run_id, "status": "stopped"}
+
+
+@router.post("/runs/{run_id}/retry")
+async def retry_prd_run(
+    run_id: str,
+    body: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    """
+    Retry a failed/stopped PRD run without creating a new run_id.
+    If `from_stage` is provided, stages before it will be resumed from cached outputs (when available)
+    and generation continues from that stage.
+    """
+    if not project_id:
+        raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
+    db = get_db()
+    oid = _as_oid(run_id, "run_id")
+    doc = await db.prd_runs.find_one(
+        {
+            "_id": oid,
+            "tenant_id": _as_oid(user.get("tenant_id"), "tenant_id"),
+            "project_id": _as_oid(project_id, "project_id"),
+        }
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    status = str(doc.get("status") or "")
+    if status not in {"failed", "stopped"}:
+        return {"run_id": run_id, "status": status}
+
+    from_stage = str((body or {}).get("from_stage") or "").strip() or None
+    if not from_stage:
+        # Best-effort: retry from the first failed stage, otherwise from the last recorded stage.
+        steps = doc.get("steps") or []
+        failed_stage = None
+        if isinstance(steps, list):
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                if str(s.get("status") or "").lower() == "failed":
+                    failed_stage = str(s.get("stage") or "").strip() or None
+                    if failed_stage:
+                        break
+            if not failed_stage and steps:
+                last = steps[-1]
+                if isinstance(last, dict):
+                    failed_stage = str(last.get("stage") or "").strip() or None
+        from_stage = failed_stage
+
+    # Clear steps from the retry stage onward so completion tracking and UI reflect the retry.
+    stages_to_clear: list[str] = []
+    if from_stage and from_stage in PRD_STAGE_SEQUENCE:
+        idx = PRD_STAGE_SEQUENCE.index(from_stage)
+        stages_to_clear = PRD_STAGE_SEQUENCE[idx:]
+
+    now = _utcnow()
+    update: dict = {
+        "$set": {
+            "status": "queued",
+            "error": None,
+            "pause_requested": False,
+            "stop_requested": False,
+            "updated_at": now,
+            "completed_at": None,
+            # restart timing for the retry attempt
+            "started_at": None,
+        }
+    }
+    if stages_to_clear:
+        update["$pull"] = {"steps": {"stage": {"$in": stages_to_clear}}}
+    await db.prd_runs.update_one({"_id": oid}, update)
+
+    try:
+        payload_dict = doc.get("request") or {}
+        payload = PRDGenerateRequest.model_validate(payload_dict)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid stored request payload: {exc}")
+
+    task = asyncio.create_task(
+        _run_prd_job(
+            run_id=oid,
+            payload=payload,
+            project_id=project_id,
+            tenant_id=str(user.get("tenant_id")),
+            created_by=str(doc.get("created_by") or user.get("user_id") or ""),
+            intake_id=str(doc.get("intake_id")) if doc.get("intake_id") else None,
+            resume_from_stage=from_stage,
+        )
+    )
+    _ACTIVE_PRD_TASKS.add(task)
+    _ACTIVE_PRD_TASKS_BY_RUN_ID[str(oid)] = task
+    task.add_done_callback(lambda t: _ACTIVE_PRD_TASKS.discard(t))
+
+    await _append_run_event(oid, {"stage": "run", "status": "queued", "error": None})
+    return {"run_id": run_id, "status": "queued", "resume_from_stage": from_stage}
 
 
 @router.post("/clarification/respond")
@@ -1301,12 +1946,13 @@ async def generate_prd_stream(
 @router.get("/latest")
 async def get_latest_prd(
     project_id: str | None = None,
+    include_saved: bool = False,
     user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
     latest_pg = await get_latest_prd_version(project_id)
-    fallback_docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id"))
+    fallback_docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id")) if include_saved else []
     latest_fb = None
     if fallback_docs:
         fallback = fallback_docs[0]
@@ -1318,20 +1964,32 @@ async def get_latest_prd(
             "markdown_content": fallback.get("content") or "",
         }
 
-    if not latest_pg and not latest_fb:
-        raise HTTPException(status_code=404, detail="PRD not found")
+    if not latest_pg:
+        # This endpoint is for the multi-step LLM PRD pipeline. The "saved" PRD in `prd_documents`
+        # is an older requirements-based artifact and can be opted into via include_saved=true.
+        if latest_fb and include_saved:
+            latest = latest_fb
+            return {
+                "project_id": latest["project_id"],
+                "version": latest["version_number"],
+                "created_by": latest["created_by"],
+                "created_at": latest["created_at"],
+                "content": _apply_prd_version_label(latest["markdown_content"], latest["version_number"]),
+                "source": "saved",
+            }
+        raise HTTPException(status_code=404, detail="LLM PRD not found")
 
-    if latest_pg and latest_fb:
-        latest = latest_pg if int(latest_pg.get("version_number") or 0) >= int(latest_fb.get("version_number") or 0) else latest_fb
-    else:
-        latest = latest_pg or latest_fb
+    # Prefer LLM-generated PRDs when available. The fallback "requirements PRD" uses a different version sequence,
+    # so comparing version numbers across sources produces confusing results.
+    latest = latest_pg
+    source = "llm"
     return {
         "project_id": latest["project_id"],
         "version": latest["version_number"],
         "created_by": latest["created_by"],
         "created_at": latest["created_at"],
         "content": _apply_prd_version_label(latest["markdown_content"], latest["version_number"]),
-        "source": "llm",
+        "source": source,
     }
 
 
@@ -1392,6 +2050,7 @@ async def export_prd(
 @router.get("/versions")
 async def get_prd_versions(
     project_id: str | None = None,
+    include_saved: bool = False,
     user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
     if not project_id:
@@ -1404,7 +2063,7 @@ async def get_prd_versions(
             continue
         by_version[num] = v
 
-    docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id"))
+    docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id")) if include_saved else []
     for d in docs:
         version = d.get("version")
         if version is None:
@@ -1433,12 +2092,16 @@ async def get_prd_versions(
 async def get_prd_by_version(
     version_number: int,
     project_id: str | None = None,
+    include_saved: bool = False,
     user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
 ):
     if not project_id:
         raise HTTPException(status_code=400, detail={"project_id": "project_id query parameter is required"})
     doc = await get_prd_version(project_id, version_number)
+    source = "llm"
     if not doc:
+        if not include_saved:
+            raise HTTPException(status_code=404, detail="LLM PRD version not found")
         fallback_docs = await _fallback_prd_documents_for_project(project_id, user.get("tenant_id"))
         matching = [d for d in fallback_docs if int(d.get("version") or -1) == int(version_number)]
         fallback = matching[0] if matching else None
@@ -1451,11 +2114,12 @@ async def get_prd_by_version(
             "created_at": fallback.get("generated_at") or fallback.get("created_at"),
             "markdown_content": fallback.get("content") or "",
         }
+        source = "saved"
     return {
         "project_id": doc["project_id"],
         "version": doc["version_number"],
         "created_by": doc["created_by"],
         "created_at": doc["created_at"],
         "content": _apply_prd_version_label(doc["markdown_content"], doc["version_number"]),
-        "source": "llm",
+        "source": source,
     }

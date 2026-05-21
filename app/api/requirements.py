@@ -5,9 +5,13 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from bson import ObjectId
 from app.db.mongo import get_db
+from app.utils.question_builder import build_questions
+from app.services.project_assistant_chat_service import generate_project_assistant_reply
 
 from app.middleware.guard import withGuard
 from app.schemas.requirements import (
+    RequirementsChatRequest,
+    RequirementsChatResponse,
     RequirementsGenerateRequest,
     RequirementsGenerateResponse,
     RequirementsRespondRequest,
@@ -15,7 +19,14 @@ from app.schemas.requirements import (
     RequirementsStartRequest,
     RequirementsStartResponse,
 )
-from app.services.requirements_service import generate_prd, respond_intake, start_intake, undo_intake, redo_intake
+from app.services.requirements_service import (
+    compute_ready_for_prd,
+    generate_prd,
+    respond_intake,
+    start_intake,
+    undo_intake,
+    redo_intake,
+)
 from app.services.prd_service import generate_prd as generate_prd_text, save_prd
 from app.services.schema_flow_service import generate_schema_flow
 from app.services.usecase_flow_service import generate_usecase_flow
@@ -33,6 +44,91 @@ _ACTIVE_SEQUENCE_TASKS_BY_RUN_ID: dict[str, asyncio.Task] = {}
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+def _trim_chat_messages_one_by_one(messages: list[dict] | None) -> list[dict]:
+    """
+    Backward-compat: older intakes may have multiple assistant questions appended at once.
+    This trims consecutive assistant questions so the UI shows a one-by-one flow.
+    We keep the most recent question in a consecutive block so newer generation clarifications
+    are not hidden behind older unanswered questions.
+    """
+    items = [m for m in (messages or []) if isinstance(m, dict)]
+    if not items:
+        return []
+
+    trimmed: list[dict] = []
+    i = 0
+    while i < len(items):
+        m = items[i]
+        role = str(m.get("role") or "").lower()
+        kind = str(m.get("kind") or "").lower()
+
+        # If we hit a question, keep only the last consecutive question until we see a user answer.
+        if role == "assistant" and kind == "question":
+            last_question = m
+            passthrough: list[dict] = []
+            j = i + 1
+            while j < len(items):
+                nxt = items[j]
+                nxt_role = str(nxt.get("role") or "").lower()
+                nxt_kind = str(nxt.get("kind") or "").lower()
+                if nxt_role == "user" and nxt_kind in {"answer", "intake"}:
+                    break
+                if nxt_role == "assistant" and nxt_kind == "question":
+                    # Keep the most recent question in the block.
+                    last_question = nxt
+                    j += 1
+                    continue
+                # keep non-question assistant messages (status/errors)
+                passthrough.append(nxt)
+                j += 1
+            trimmed.append(last_question)
+            trimmed.extend(passthrough)
+            i = j
+            continue
+
+        trimmed.append(m)
+        i += 1
+
+    return trimmed
+
+
+def _dedupe_questions_by_field_key(messages: list[dict] | None) -> list[dict]:
+    items = [m for m in (messages or []) if isinstance(m, dict)]
+    if not items:
+        return []
+    last_idx: dict[str, int] = {}
+    for i, m in enumerate(items):
+        role = str(m.get("role") or "").lower()
+        kind = str(m.get("kind") or "").lower()
+        fk = str(m.get("field_key") or "").strip()
+        if role == "assistant" and kind == "question" and fk:
+            last_idx[fk] = i
+    if not last_idx:
+        return items
+    out: list[dict] = []
+    for i, m in enumerate(items):
+        role = str(m.get("role") or "").lower()
+        kind = str(m.get("kind") or "").lower()
+        fk = str(m.get("field_key") or "").strip()
+        if role == "assistant" and kind == "question" and fk and last_idx.get(fk, i) != i:
+            continue
+        out.append(m)
+    return out
+
+
+def _serialize_chat_messages(messages: list[dict] | None) -> list[dict]:
+    out: list[dict] = []
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        created_at = m.get("created_at")
+        if isinstance(created_at, datetime):
+            created_at = created_at.isoformat()
+        elif created_at is not None and not isinstance(created_at, str):
+            created_at = str(created_at)
+        out.append({**m, "created_at": created_at})
+    return out
 
 
 def _coerce_utc_datetime(value) -> datetime | None:
@@ -133,6 +229,10 @@ async def _append_sdd_run_event(run_id: ObjectId, event: dict) -> None:
             update_doc["steps.$.retry_count"] = event.get("retry_count")
         if event.get("error"):
             update_doc["steps.$.error"] = event.get("error")
+        if event.get("stage_output") is not None:
+            update_doc["steps.$.stage_output"] = event.get("stage_output")
+        if event.get("stage_output_full") is not None:
+            update_doc["steps.$.stage_output_full"] = event.get("stage_output_full")
         await db.sdd_runs.update_one({"_id": run_id, "steps.stage": stage}, {"$set": update_doc})
     else:
         await db.sdd_runs.update_one(
@@ -148,11 +248,29 @@ async def _append_sdd_run_event(run_id: ObjectId, event: dict) -> None:
                         "input_tokens": event.get("input_tokens"),
                         "output_tokens": event.get("output_tokens"),
                         "retry_count": event.get("retry_count"),
+                        "stage_output": event.get("stage_output"),
+                        "stage_output_full": event.get("stage_output_full"),
                         "error": event.get("error"),
                         "updated_at": now,
                     }
                 },
                 "$set": {"updated_at": now},
+            },
+        )
+
+    # Store the latest partial markdown so the UI doc preview can update during generation.
+    partial_markdown = event.get("partial_markdown")
+    if isinstance(partial_markdown, str) and partial_markdown.strip():
+        await db.sdd_runs.update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "partial_result": {
+                        "stage": stage,
+                        "sdd_markdown": partial_markdown,
+                        "updated_at": now,
+                    }
+                }
             },
         )
 
@@ -188,10 +306,11 @@ async def _run_sdd_job(
                     await asyncio.sleep(1)
                     continue
                 break
-            await db.sdd_runs.update_one(
-                {"_id": run_id},
-                {"$set": {"status": "running", "updated_at": _utcnow()}},
-            )
+            # Avoid races where a stop request arrives right before we flip back to running.
+            run_doc = await db.sdd_runs.find_one({"_id": run_id}, {"stop_requested": 1})
+            if run_doc and run_doc.get("stop_requested"):
+                raise asyncio.CancelledError("Run stopped by user.")
+            await db.sdd_runs.update_one({"_id": run_id}, {"$set": {"status": "running", "updated_at": _utcnow()}})
 
         content = await generate_system_design(
             structured,
@@ -938,6 +1057,139 @@ async def respond_requirements(
     return result
 
 
+@router.post("/chat", response_model=RequirementsChatResponse)
+async def requirements_chat(
+    payload: RequirementsChatRequest,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+
+    # Start: no intake_id, requires message
+    if not payload.intake_id:
+        message = (payload.message or "").strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="message is required to start requirements chat")
+        try:
+            result = await start_intake(user.get("tenant_id"), project_id, message)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        result["chat_messages"] = _serialize_chat_messages(result.get("chat_messages") or [])
+        return result
+
+    # Respond: has intake_id, requires answers or (field_key + message)
+    answers: dict = {}
+    if isinstance(payload.answers, dict) and payload.answers:
+        answers = payload.answers
+    else:
+        message = (payload.message or "").strip()
+        field_key = (payload.field_key or "").strip()
+        if message and field_key:
+            answers = {field_key: message}
+
+    if not answers:
+        raise HTTPException(
+            status_code=400,
+            detail="answers is required (or provide field_key + message) when intake_id is present",
+        )
+
+    try:
+        result = await respond_intake(payload.intake_id, answers)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # respond_intake now returns a chat-ready payload, but it doesn't include intake_id
+    result["intake_id"] = payload.intake_id
+    result["chat_messages"] = _serialize_chat_messages(result.get("chat_messages") or [])
+    return result
+
+
+@router.post("/{intake_id}/assistant-chat", response_model=RequirementsChatResponse)
+async def assistant_chat(
+    intake_id: str,
+    payload: dict,
+    project_id: str | None = None,
+    user=Depends(withGuard(feature="edit_decision", projectRole="contributor")),
+):
+    """
+    Freeform project assistant chat tied to a requirements intake.
+
+    This is separate from /chat which is strictly for clarification Q/A.
+    """
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id query parameter is required")
+    message = str((payload or {}).get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    db = get_db()
+    intake = await db.requirements_intakes.find_one(
+        {
+            "_id": ObjectId(intake_id),
+            "tenant_id": ObjectId(user.get("tenant_id")),
+            "project_id": ObjectId(project_id),
+        }
+    )
+    if not intake:
+        raise HTTPException(status_code=404, detail="Intake not found")
+
+    now = _utcnow().isoformat()
+    chat_messages: list[dict] = list(intake.get("chat_messages") or [])
+    chat_messages.append({"role": "user", "kind": "chat", "text": message, "field_key": None, "created_at": now})
+
+    structured = intake.get("structured") or {}
+    try:
+        reply = await generate_project_assistant_reply(
+            tenant_id=user.get("tenant_id"),
+            project_id=project_id,
+            structured=structured,
+            chat_messages=chat_messages,
+            user_message=message,
+        )
+    except Exception as exc:
+        logger.exception("assistant_chat_failed intake_id=%s project_id=%s", intake_id, project_id)
+        reply = f"Assistant chat failed: {str(exc)}"
+
+    chat_messages.append({"role": "assistant", "kind": "chat", "text": reply, "field_key": None, "created_at": now})
+    chat_messages = _serialize_chat_messages(_dedupe_questions_by_field_key(_trim_chat_messages_one_by_one(chat_messages)))
+    # Prevent unbounded growth causing LLM context overflows on future assistant-chat calls.
+    if len(chat_messages) > 80:
+        chat_messages = chat_messages[-80:]
+
+    missing = intake.get("missing_fields") or []
+    low_quality = intake.get("low_quality_fields") or []
+    question_fields_all = [*missing, *low_quality]
+    current_question_fields = question_fields_all[:1]
+    current_questions = build_questions(question_fields_all)[:1] if question_fields_all else []
+    ready_for_prd = len(missing) == 0 and len(low_quality) == 0
+
+    await db.requirements_intakes.update_one(
+        {"_id": intake["_id"]},
+        {
+            "$set": {
+                "chat_messages": chat_messages,
+                "questions": current_questions,
+                "question_fields": current_question_fields,
+                "updated_at": _utcnow(),
+            }
+        },
+    )
+
+    return {
+        "intake_id": str(intake["_id"]),
+        "raw_text": intake.get("raw_text"),
+        "structured_partial": structured,
+        "missing_fields": missing,
+        "low_quality_fields": low_quality,
+        "questions": current_questions,
+        "question_fields": current_question_fields,
+        "answers": intake.get("answers") or {},
+        "chat_messages": chat_messages,
+        "ready_for_prd": ready_for_prd,
+        "status": "ready" if ready_for_prd else "needs_info",
+    }
+
+
 @router.post("/generate", response_model=RequirementsGenerateResponse)
 async def generate_requirements(
     payload: RequirementsGenerateRequest,
@@ -1114,6 +1366,7 @@ async def get_system_design_run_status(
         "steps": doc.get("steps") or [],
         "error": doc.get("error"),
         "result": doc.get("result"),
+        "partial_result": doc.get("partial_result"),
         "timing": {"total_elapsed_seconds": total_elapsed},
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
@@ -1203,7 +1456,7 @@ async def stop_system_design_run(
             }
         },
     )
-    task = _ACTIVE_SDD_TASKS_BY_RUN_ID.get(run_id)
+    task = _ACTIVE_SDD_TASKS_BY_RUN_ID.get(run_id) or _ACTIVE_SDD_TASKS_BY_RUN_ID.get(str(oid))
     if task and not task.done():
         task.cancel()
     await _append_sdd_run_event(oid, {"stage": "run", "status": "stopped", "error": "Run stopped by user."})
@@ -1359,12 +1612,27 @@ async def get_latest_requirements_status(
 
     missing = intake.get("missing_fields") or []
     low_quality = intake.get("low_quality_fields") or []
+    question_fields_all = [*missing, *low_quality]
+    current_question_fields = question_fields_all[:1]
+    current_questions = build_questions(question_fields_all)[:1] if question_fields_all else []
+    chat_messages = _serialize_chat_messages(
+        _dedupe_questions_by_field_key(_trim_chat_messages_one_by_one(intake.get("chat_messages") or []))
+    )
+    # Persist trimmed chat/questions for backward compatibility.
+    await db.requirements_intakes.update_one(
+        {"_id": intake["_id"]},
+        {"$set": {"chat_messages": chat_messages, "questions": current_questions, "question_fields": current_question_fields}},
+    )
     return {
         "intake_id": str(intake["_id"]),
+        "raw_text": intake.get("raw_text"),
         "structured_partial": intake.get("structured") or {},
+        "answers": intake.get("answers") or {},
+        "chat_messages": chat_messages,
+        "question_fields": current_question_fields,
         "missing_fields": missing,
         "low_quality_fields": low_quality,
-        "questions": intake.get("questions") or [],
+        "questions": current_questions,
         "ready_for_prd": len(missing) == 0 and len(low_quality) == 0,
     }
 
@@ -1383,11 +1651,25 @@ async def get_requirements_status(
         raise HTTPException(status_code=404, detail="Intake not found")
     missing = intake.get("missing_fields") or []
     low_quality = intake.get("low_quality_fields") or []
+    question_fields_all = [*missing, *low_quality]
+    current_question_fields = question_fields_all[:1]
+    current_questions = build_questions(question_fields_all)[:1] if question_fields_all else []
+    chat_messages = _serialize_chat_messages(
+        _dedupe_questions_by_field_key(_trim_chat_messages_one_by_one(intake.get("chat_messages") or []))
+    )
+    await db.requirements_intakes.update_one(
+        {"_id": intake["_id"]},
+        {"$set": {"chat_messages": chat_messages, "questions": current_questions, "question_fields": current_question_fields}},
+    )
     return {
+        "raw_text": intake.get("raw_text"),
         "structured_partial": intake.get("structured") or {},
+        "answers": intake.get("answers") or {},
+        "chat_messages": chat_messages,
+        "question_fields": current_question_fields,
         "missing_fields": missing,
         "low_quality_fields": low_quality,
-        "questions": intake.get("questions") or [],
+        "questions": current_questions,
         "ready_for_prd": len(missing) == 0 and len(low_quality) == 0,
     }
 

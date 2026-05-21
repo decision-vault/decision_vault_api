@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from bson import ObjectId
 
 from app.middleware.auth import get_current_user
+from app.middleware.guard import withGuard
 from app.middleware.rbac import requireOrgRole, requireProjectRole
 from app.core.rbac import is_super_admin
 from app.schemas.license import License, LicenseCreate, LicenseUpdate
+from app.schemas.project_access import ProjectInviteByEmail
 from app.schemas.project_member import (
     ProjectMember,
     ProjectMemberCreate,
@@ -26,12 +28,50 @@ from app.services.project_member_service import (
     restore_project_member,
     update_project_member,
 )
+from app.services.project_access_service import (
+    decide_access_request,
+    invite_user_to_project_by_email,
+    list_access_requests,
+    list_my_access_requests,
+    list_project_catalog,
+    request_project_access,
+)
 from app.services.llm_health_service import probe_llm
 from app.db.mongo import get_db
 from app.utils.serialize import serialize_doc
 
 
 router = APIRouter(prefix="/api", tags=["resources"])
+
+
+def _json_safe(value):
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _normalize_catalog(doc: dict) -> dict:
+    if not doc:
+        return doc
+    if "_id" in doc:
+        doc["id"] = str(doc.pop("_id"))
+    return doc
+
+
+def _normalize_access_request(doc: dict) -> dict:
+    if not doc:
+        return doc
+    doc = _json_safe(doc)
+    if "_id" in doc:
+        doc["id"] = doc.pop("_id")
+    doc["project_id"] = str(doc.get("project_id") or "")
+    doc["user_id"] = str(doc.get("user_id") or "")
+    doc["decided_by_user_id"] = str(doc.get("decided_by_user_id") or "") or None
+    return doc
 
 
 @router.get("/licenses/current", response_model=License)
@@ -128,6 +168,121 @@ async def project_members(
     project_id: str, user=Depends(requireProjectRole(permission="project.read"))
 ):
     return await list_project_members(user.get("tenant_id"), project_id)
+
+
+@router.get("/projects/catalog")
+async def project_catalog(
+    request: Request,
+    _guard=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    projects = await list_project_catalog(tenant_id=request.state.tenant_id)
+    return [_normalize_catalog(doc) for doc in projects]
+
+
+@router.post("/projects/{project_id}/access-requests")
+async def request_project_access_route(
+    project_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    try:
+        doc = await request_project_access(
+            tenant_id=request.state.tenant_id,
+            user_id=user.get("user_id"),
+            project_id=project_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _normalize_access_request(doc)
+
+
+@router.get("/projects/my-access-requests")
+async def my_project_access_requests(
+    request: Request,
+    user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
+):
+    docs = await list_my_access_requests(
+        tenant_id=request.state.tenant_id,
+        user_id=user.get("user_id"),
+        status="pending",
+    )
+    return [_normalize_access_request(doc) for doc in docs]
+
+
+@router.get("/projects/access-requests")
+async def list_project_access_requests(
+    request: Request,
+    _guard=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    docs = await list_access_requests(tenant_id=request.state.tenant_id, status="pending")
+    return [_normalize_access_request(doc) for doc in docs]
+
+
+@router.post("/projects/access-requests/{request_id}/approve")
+async def approve_project_access_request(
+    request_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        doc = await decide_access_request(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            request_id=request_id,
+            decision="approved",
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _normalize_access_request(doc)
+
+
+@router.post("/projects/access-requests/{request_id}/reject")
+async def reject_project_access_request(
+    request_id: str,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        doc = await decide_access_request(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            request_id=request_id,
+            decision="rejected",
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _normalize_access_request(doc)
+
+
+@router.post("/projects/{project_id}/invites")
+async def invite_to_project_by_email(
+    project_id: str,
+    payload: ProjectInviteByEmail,
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="admin")),
+):
+    try:
+        user_id_added, invite_payload = await invite_user_to_project_by_email(
+            tenant_id=request.state.tenant_id,
+            actor_user_id=user.get("user_id"),
+            project_id=project_id,
+            email=str(payload.email),
+            project_role=payload.role,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if user_id_added:
+        return {"status": "added", "user_id": user_id_added}
+    return {"status": "needs_org_invite", "invite": invite_payload}
 
 
 @router.post(

@@ -36,6 +36,12 @@ async def get_current_user(
     if not user:
         raise _unauthorized("User not found")
 
+    if user.get("deleted_at") is not None:
+        raise _unauthorized("User deleted")
+
+    if user.get("is_active", True) is False:
+        raise _unauthorized("User deactivated")
+
     if str(user.get("tenant_id")) != payload.get("tenant_id"):
         raise _unauthorized("Tenant mismatch")
 

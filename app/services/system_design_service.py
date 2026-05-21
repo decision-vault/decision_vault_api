@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
+import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, get_origin
 
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -218,7 +220,17 @@ def _normalize_openai_base_url(base_url: str | None, provider: str) -> str | Non
 
 
 def _extract_json_candidate(text: str) -> str:
-    stripped = text.strip()
+    stripped = str(text or "").strip()
+    stripped = stripped.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    stripped = stripped.lstrip("\ufeff")
+    stripped = stripped.strip()
+    stripped = stripped.removeprefix("```json").removeprefix("```JSON").strip()
+    if stripped.startswith("```"):
+        stripped = stripped[3:].lstrip()
+    if stripped.endswith("```"):
+        stripped = stripped[:-3].rstrip()
+    if stripped.lower().startswith("json"):
+        stripped = stripped[4:].lstrip()
     if stripped.startswith("{") and stripped.endswith("}"):
         return stripped
     start = stripped.find("{")
@@ -233,6 +245,182 @@ def _repair_json(raw: str) -> str:
     if text.count("{") > text.count("}"):
         text = text + ("}" * (text.count("{") - text.count("}")))
     return text
+
+
+def _balance_json_like(text: str) -> str:
+    stack: list[str] = []
+    out: list[str] = []
+    in_string = False
+    escape = False
+    pairs = {"{": "}", "[": "]"}
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch in "{[":
+            stack.append(pairs[ch])
+            out.append(ch)
+            continue
+        if ch in "}]":
+            if stack and ch == stack[-1]:
+                stack.pop()
+                out.append(ch)
+            continue
+        out.append(ch)
+    while stack:
+        out.append(stack.pop())
+    return "".join(out)
+
+
+def _repair_truncated_json(text: str) -> str:
+    candidate = _extract_json_candidate(text)
+    start = candidate.find("{")
+    if start >= 0:
+        candidate = candidate[start:]
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+
+    in_string = False
+    escaped = False
+    for ch in candidate:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+    if in_string:
+        if candidate.endswith("\\"):
+            candidate += " "
+        candidate += '"'
+
+    brace_diff = candidate.count("{") - candidate.count("}")
+    bracket_diff = candidate.count("[") - candidate.count("]")
+    if bracket_diff > 0:
+        candidate += "]" * bracket_diff
+    if brace_diff > 0:
+        candidate += "}" * brace_diff
+    return candidate
+
+
+def _strip_json_comments(text: str) -> str:
+    cleaned = re.sub(r"/\\*[\\s\\S]*?\\*/", "", text)
+    cleaned = re.sub(r"(?m)^\\s*//.*$", "", cleaned)
+    return cleaned
+
+
+def _quote_unquoted_keys(text: str) -> str:
+    return re.sub(
+        r'([\\{\\[,]\\s*)([A-Za-z_][A-Za-z0-9_]*)(\\s*):',
+        r'\\1"\\2"\\3:',
+        text,
+    )
+
+
+def _maybe_convert_single_quotes(text: str) -> str:
+    s = text
+    if '"' in s:
+        return s
+    if s.count("'") < 4:
+        return s
+
+    def _repl(match: re.Match) -> str:
+        inner = match.group(1)
+        inner = inner.replace('\\"', '"').replace('"', '\\"')
+        return f'"{inner}"'
+
+    return re.sub(r"'([^'\\\\]*(?:\\\\.[^'\\\\]*)*)'", _repl, s)
+
+
+def _escape_newlines_in_strings(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                escaped = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _escape_unescaped_quotes_in_strings(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    n = len(text)
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                escaped = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                nxt = text[j] if j < n else ""
+                if nxt in {":", ",", "}", "]"}:
+                    in_string = False
+                    out.append(ch)
+                    continue
+                out.append('\\"')
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _coerce_jsonish(text: str) -> str:
+    cleaned = _extract_json_candidate(text)
+    cleaned = _strip_json_comments(cleaned)
+    cleaned = _quote_unquoted_keys(cleaned)
+    cleaned = re.sub(r",\\s*([}\\]])", r"\\1", cleaned)
+    cleaned = _maybe_convert_single_quotes(cleaned)
+    cleaned = _escape_newlines_in_strings(cleaned)
+    cleaned = _escape_unescaped_quotes_in_strings(cleaned)
+    return cleaned.strip()
 
 
 def _split_to_list(value: str) -> list[str]:
@@ -275,12 +463,116 @@ def _normalize_stage_lists(value: Any, list_fields: set[str]) -> Any:
     return normalized
 
 
+def _parse_loose_by_schema(text: str, schema: type[BaseModel]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    fields = list(schema.model_fields.keys())
+    positions: list[tuple[str, int, int]] = []
+    for key in fields:
+        m = re.search(rf'(?<![A-Za-z0-9_])"?{re.escape(key)}"?\s*:', text)
+        if m:
+            positions.append((key, m.start(), m.end()))
+    if not positions:
+        raise ValueError("No schema keys found in model output")
+    positions.sort(key=lambda x: x[1])
+
+    for idx, (key, _, end_pos) in enumerate(positions):
+        next_start = positions[idx + 1][1] if idx + 1 < len(positions) else len(text)
+        raw_value = text[end_pos:next_start].strip()
+        raw_value = raw_value.rstrip(",").strip()
+        payload[key] = _parse_loose_value(raw_value, schema, key)
+    return payload
+
+
+def _parse_loose_value(raw_value: str, schema: type[BaseModel], key: str) -> Any:
+    if not raw_value:
+        return "Insufficient information provided."
+
+    annotation = schema.model_fields[key].annotation
+    is_list = get_origin(annotation) is list
+
+    value = raw_value.strip()
+    while value.endswith("}") and not value.startswith("{"):
+        value = value[:-1].rstrip()
+
+    if value.startswith('"'):
+        inner = value[1:-1] if len(value) >= 2 and value.endswith('"') else value[1:]
+        inner = inner.replace('\\"', '"').replace("\\n", "\n").replace("\\t", " ")
+        return _split_to_list(inner) if is_list else inner
+
+    if value.startswith("["):
+        repaired = _repair_truncated_json(value)
+        try:
+            parsed = json.loads(repaired)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(repaired)
+            except Exception:
+                parsed = _split_to_list(value)
+        if is_list:
+            return parsed if isinstance(parsed, list) else _split_to_list(str(parsed))
+        if isinstance(parsed, list):
+            return ", ".join([str(v) for v in parsed])
+        return str(parsed)
+
+    if value.startswith("{"):
+        repaired = _repair_truncated_json(value)
+        try:
+            parsed = json.loads(repaired)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(repaired)
+            except Exception:
+                parsed = value
+        if is_list and isinstance(parsed, dict):
+            return [f"{k}: {v}" for k, v in parsed.items()]
+        return parsed if not is_list else _split_to_list(str(parsed))
+
+    return _split_to_list(value) if is_list else value
+
+
+def _parse_structured(raw: str, schema: type[BaseModel]) -> dict[str, Any]:
+    candidate = _extract_json_candidate(raw)
+    parsed: Any
+    last_exc: Exception | None = None
+    try:
+        parsed = json.loads(candidate)
+    except Exception as exc0:
+        last_exc = exc0
+        try:
+            parsed = json.loads(_coerce_jsonish(candidate))
+        except Exception as exc1:
+            last_exc = exc1
+            repaired = _repair_truncated_json(candidate)
+            balanced = _balance_json_like(repaired)
+            try:
+                parsed = json.loads(repaired)
+            except Exception as exc2:
+                last_exc = exc2
+                try:
+                    parsed = json.loads(_coerce_jsonish(balanced))
+                except Exception as exc3:
+                    last_exc = exc3
+                    try:
+                        parsed = ast.literal_eval(balanced)
+                    except Exception as exc4:
+                        last_exc = exc4
+                        parsed = _parse_loose_by_schema(balanced, schema)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM output is not a JSON object") from last_exc
+    return parsed
+
+
 def _parse_json(raw: str) -> dict[str, Any]:
     candidate = _repair_json(_extract_json_candidate(raw))
     try:
         parsed = json.loads(candidate)
     except Exception:
-        parsed = ast.literal_eval(candidate)
+        try:
+            coerced = _coerce_jsonish(candidate)
+            parsed = json.loads(coerced)
+        except Exception:
+            parsed = ast.literal_eval(candidate)
     if not isinstance(parsed, dict):
         raise ValueError("LLM output is not a JSON object")
     return parsed
@@ -332,8 +624,35 @@ async def _invoke_llm(prompt: str, output_tokens: int) -> tuple[str, int, str]:
         max_tokens=output_tokens,
         api_key=api_key,
         base_url=normalized_base_url,
+        # LangChain/OpenAI client-level retry is helpful for transient network blips.
+        # We'll still wrap connection failures to surface a more actionable error.
+        max_retries=2,
+        timeout=getattr(settings, "llm_request_timeout_seconds", 180),
     )
-    msg = await llm.ainvoke(prompt)
+    try:
+        msg = await llm.ainvoke(prompt)
+    except asyncio.CancelledError:
+        # Important: do not swallow cancellation. The API stop endpoint relies on this propagating.
+        raise
+    except Exception as exc:
+        # If the upstream is down/unreachable, the raw exception is usually not actionable.
+        # Provide a hint based on the configured provider/base_url.
+        hint = ""
+        if provider == "lmstudio":
+            hint = (
+                "If you're using LM Studio, make sure the server is running and exposing an OpenAI-compatible "
+                f"endpoint (current base_url={normalized_base_url!r})."
+            )
+        elif normalized_base_url:
+            hint = f"Check network connectivity to the configured base_url={normalized_base_url!r}."
+        else:
+            hint = "Check network connectivity to the LLM provider."
+
+        exc_name = exc.__class__.__name__
+        raise ValueError(
+            "LLM connection failed "
+            f"(provider={provider!r}, model={model_name!r}, error_type={exc_name}). {hint}"
+        ) from exc
     text = (getattr(msg, "content", "") or "").strip()
     meta = getattr(msg, "response_metadata", {}) or {}
     usage = meta.get("token_usage") or meta.get("usage") or {}
@@ -369,9 +688,17 @@ async def _run_stage(
 
     last_error: Exception | None = None
     for attempt in range(2):
-        raw_text, total_tokens, model_name = await _invoke_llm(prompt, MAX_OUTPUT_TOKENS)
         try:
-            parsed = _parse_json(raw_text)
+            raw_text, total_tokens, model_name = await _invoke_llm(prompt, MAX_OUTPUT_TOKENS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            # Brief backoff to avoid hammering a downed local/remote endpoint.
+            await asyncio.sleep(0.5 * (attempt + 1))
+            continue
+        try:
+            parsed = _parse_structured(raw_text, schema)
             result = schema.model_validate(parsed)
             output_tokens = max(1, total_tokens - input_tokens)
             await log_llm_usage(
@@ -386,6 +713,15 @@ async def _run_stage(
             if progress_cb:
                 completed_at = _utcnow()
                 duration = max(0.0, (completed_at - started_at).total_seconds())
+                stage_output_full = None
+                stage_output = None
+                try:
+                    stage_output_full = result.model_dump()
+                    # Small summary payload for UI timelines.
+                    stage_output = stage_output_full
+                except Exception:
+                    stage_output_full = None
+                    stage_output = None
                 await progress_cb(
                     {
                         "stage": stage_name,
@@ -395,9 +731,13 @@ async def _run_stage(
                         "retry_count": attempt,
                         "duration_seconds": round(duration, 3),
                         "completed_at": completed_at.isoformat(),
+                        **({"stage_output": stage_output} if stage_output is not None else {}),
+                        **({"stage_output_full": stage_output_full} if stage_output_full is not None else {}),
                     }
                 )
             return result
+        except asyncio.CancelledError:
+            raise
         except (ValidationError, ValueError, SyntaxError) as exc:
             last_error = exc
             continue
@@ -605,6 +945,62 @@ async def generate_system_design(
         except Exception:
             retrieved_chunks = []
 
+    LOADING = "<!-- dv:loading -->"
+
+    def _render_partial(structured: dict, s1: Stage1Output | None, s2: Stage2Output | None, s3: Stage3Output | None, s4: Stage4Output | None) -> str:
+        project_name = structured.get("project_name") or "DecisionVault"
+        date_str = _utcnow().strftime("%B %d, %Y")
+        parts: list[str] = []
+        parts.append("# System Design Document (SDD)\n")
+        parts.append(f"## {project_name}\n")
+        parts.append(f"**Version:** 1.0  \n**Date:** {date_str}  \n**Status:** Generating\n")
+
+        if s1 is None:
+            parts.append(LOADING)
+            return "\n".join(parts).strip() + "\n"
+
+        parts.append("## Executive Summary\n" + (s1.executive_summary or LOADING) + "\n")
+        parts.append("## Document Purpose and Scope\n")
+        parts.append("### Purpose\n" + (s1.purpose or LOADING) + "\n")
+        parts.append("### Scope\nIn Scope:\n" + _safe_bullets(s1.scope_in) + "\n\nOut of Scope:\n" + _safe_bullets(s1.scope_out) + "\n")
+        parts.append("## System Architecture Overview\n" + (s1.architecture_overview or LOADING) + "\n")
+
+        if s2 is None:
+            parts.append(LOADING)
+            return "\n".join(parts).strip() + "\n"
+
+        parts.append("## Data Architecture\n" + (s2.data_model_overview or LOADING) + "\n")
+        parts.append("## Component Architecture\n" + (s2.api_design_overview or LOADING) + "\n")
+
+        if s3 is None:
+            parts.append(LOADING)
+            return "\n".join(parts).strip() + "\n"
+
+        parts.append("## Security and Compliance\n")
+        parts.append("### Authentication\n" + _safe_bullets(s3.security_auth) + "\n")
+        parts.append("### RBAC and Authorization\n" + _safe_bullets(s3.security_rbac) + "\n")
+        parts.append("### Data Protection\n" + _safe_bullets(s3.security_data) + "\n")
+        parts.append("### Audit Logging\n" + _safe_bullets(s3.security_audit) + "\n")
+        parts.append("## Performance and Scalability\n")
+        parts.append("### Performance Targets\n" + _safe_bullets(s3.performance_targets) + "\n")
+        parts.append("### Scaling Plan\n" + _safe_bullets(s3.scaling_plan) + "\n")
+
+        if s4 is None:
+            parts.append(LOADING)
+            return "\n".join(parts).strip() + "\n"
+
+        parts.append("## Monitoring and Observability\n" + _safe_bullets(s4.monitoring_logging) + "\n")
+        parts.append("## Deployment and Operations\n" + _safe_bullets(s4.cicd_pipeline) + "\n")
+        return "\n".join(parts).strip() + "\n"
+
+    async def _emit_partial(stage: str, s1: Stage1Output | None, s2: Stage2Output | None, s3: Stage3Output | None, s4: Stage4Output | None) -> None:
+        if not progress_cb:
+            return
+        try:
+            await progress_cb({"stage": stage, "status": "completed", "partial_markdown": _render_partial(prd, s1, s2, s3, s4)})
+        except Exception:
+            return
+
     stage1 = await _run_stage(
         stage_name="sdd_stage_1_context",
         schema=Stage1Output,
@@ -626,6 +1022,7 @@ async def generate_system_design(
         tenant_id=tenant_id,
         progress_cb=progress_cb,
     )
+    await _emit_partial("sdd_stage_1_context", stage1, None, None, None)
 
     stage2 = await _run_stage(
         stage_name="sdd_stage_2_data_api",
@@ -645,6 +1042,7 @@ async def generate_system_design(
         tenant_id=tenant_id,
         progress_cb=progress_cb,
     )
+    await _emit_partial("sdd_stage_2_data_api", stage1, stage2, None, None)
 
     stage3 = await _run_stage(
         stage_name="sdd_stage_3_security_performance",
@@ -663,6 +1061,7 @@ async def generate_system_design(
         tenant_id=tenant_id,
         progress_cb=progress_cb,
     )
+    await _emit_partial("sdd_stage_3_security_performance", stage1, stage2, stage3, None)
 
     stage4 = await _run_stage(
         stage_name="sdd_stage_4_ops_quality",
@@ -681,6 +1080,7 @@ async def generate_system_design(
         tenant_id=tenant_id,
         progress_cb=progress_cb,
     )
+    await _emit_partial("sdd_stage_4_ops_quality", stage1, stage2, stage3, stage4)
 
     rendered = _render_sdd(prd, stage1, stage2, stage3, stage4)
     if project_id:

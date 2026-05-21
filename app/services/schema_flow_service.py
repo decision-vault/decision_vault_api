@@ -16,8 +16,27 @@ from app.services.project_vector_memory_service import (
     store_project_source_text,
     sync_project_knowledge_chunks,
 )
+from app.services.token_limiter import TokenLimiter
 
 TABLE_NODE_TYPE = "schemaTable"
+MAX_OUTPUT_TOKENS = 1200
+MAX_INPUT_TOKENS = 1500
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def _context_window_tokens(provider: str) -> int:
+    # LM Studio / llama.cpp will error if we exceed the model context. Default to 4096 there.
+    ctx = int(getattr(settings, "llm_context_window_tokens", 4096) or 4096)
+    if provider == "lmstudio":
+        ctx = min(ctx, 4096)
+    return max(1024, ctx)
+
+
+def _context_safety_margin_tokens() -> int:
+    return int(getattr(settings, "llm_context_safety_margin_tokens", 450) or 450)
 
 
 class SchemaColumn(BaseModel):
@@ -122,6 +141,80 @@ def _normalize_column_type(raw: str) -> str:
         "object": "jsonb",
     }
     return mapping.get(value, value or "text")
+
+
+def _compact_current_graph(current_nodes: list[dict[str, Any]], current_edges: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Keep IDs stable but avoid bloating the prompt.
+    nodes: list[dict[str, Any]] = []
+    for n in (current_nodes or [])[:30]:
+        if not isinstance(n, dict):
+            continue
+        data = n.get("data") if isinstance(n.get("data"), dict) else {}
+        cols = data.get("columns") if isinstance(data.get("columns"), list) else []
+        cols_out = []
+        for c in cols[:18]:
+            if not isinstance(c, dict):
+                continue
+            cols_out.append(
+                {
+                    "name": str(c.get("name") or "").strip(),
+                    "type": str(c.get("type") or "").strip(),
+                    "primaryKey": bool(c.get("primaryKey")),
+                    "unique": bool(c.get("unique")),
+                }
+            )
+        nodes.append(
+            {
+                "id": str(n.get("id") or ""),
+                "type": str(n.get("type") or TABLE_NODE_TYPE),
+                "data": {"tableName": str(data.get("tableName") or ""), "columns": cols_out},
+            }
+        )
+
+    edges: list[dict[str, Any]] = []
+    for e in (current_edges or [])[:60]:
+        if not isinstance(e, dict):
+            continue
+        edges.append(
+            {
+                "id": str(e.get("id") or ""),
+                "source": str(e.get("source") or ""),
+                "target": str(e.get("target") or ""),
+                "sourceHandle": e.get("sourceHandle"),
+                "targetHandle": e.get("targetHandle"),
+            }
+        )
+    return nodes, edges
+
+
+def _bounded_payload(payload: dict[str, Any], *, max_tokens: int) -> dict[str, Any]:
+    raw = json.dumps(payload, ensure_ascii=False)
+    if _estimate_tokens(raw) <= max_tokens:
+        return payload
+
+    compressed: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            compressed[key] = TokenLimiter.compress_text(value, max_tokens=250)
+        elif isinstance(value, list):
+            trimmed: list[Any] = []
+            for item in value[:25]:
+                if isinstance(item, str):
+                    trimmed.append(TokenLimiter.compress_text(item, max_tokens=60))
+                elif isinstance(item, dict):
+                    trimmed.append({k: TokenLimiter.compress_text(str(v), max_tokens=30) for k, v in item.items()})
+                else:
+                    trimmed.append(item)
+            compressed[key] = trimmed
+        elif isinstance(value, dict):
+            compressed[key] = {k: TokenLimiter.compress_text(str(v), max_tokens=40) for k, v in value.items()}
+        else:
+            compressed[key] = value
+
+    # If still too large, collapse into a short summary blob.
+    if _estimate_tokens(json.dumps(compressed, ensure_ascii=False)) > max_tokens:
+        compressed = {"summary": TokenLimiter.compress_text(raw, max_tokens=max(120, int(max_tokens * 0.7)))}
+    return compressed
 
 
 def _sanitize_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -515,21 +608,26 @@ async def generate_schema_flow(
         except Exception:
             retrieved_chunks = []
 
-    sdd_excerpt = (latest_sdd_content or "").strip()
-    if len(sdd_excerpt) > 12000:
-        sdd_excerpt = sdd_excerpt[:12000]
+    model_name, _, _, provider = _provider_config()
+    sdd_excerpt = TokenLimiter.compress_text((latest_sdd_content or "").strip(), max_tokens=650)
+    chunks_compact = [TokenLimiter.compress_text(str(c), max_tokens=220) for c in (retrieved_chunks or [])[:4]]
+    nodes_compact, edges_compact = _compact_current_graph(current_nodes, current_edges)
     payload = {
         "project_name": structured.get("project_name"),
         "desired_features": structured.get("desired_features") or [],
         "constraints": (structured.get("constraints") or {}).get("hard_constraints") or [],
         "latest_system_design_context": sdd_excerpt,
-        "retrieved_project_knowledge_chunks": retrieved_chunks,
-        "current_nodes": current_nodes,
-        "current_edges": current_edges,
+        "retrieved_project_knowledge_chunks": chunks_compact,
+        "current_nodes": nodes_compact,
+        "current_edges": edges_compact,
         "user_request": user_request,
     }
-    input_json = json.dumps(payload, ensure_ascii=False)
-    base_prompt = (
+    # Build a context-window aware prompt.
+    context_window = _context_window_tokens(provider)
+    safety = _context_safety_margin_tokens()
+    max_total_tokens = max(512, context_window - safety)
+
+    prefix = (
         "You are a database architect assistant. "
         "Update a React Flow DB schema graph from user request. "
         "Return JSON only with keys: nodes, edges, summary. "
@@ -543,14 +641,37 @@ async def generate_schema_flow(
         "Each table should include useful fields and audit columns where applicable. "
         "Generate relationship edges for foreign-key columns like '<table>_id'. "
         "Keep existing IDs stable when possible.\n\n"
-        f"Input:\n{input_json}"
+        "Rules: output a single valid JSON object only. Start with '{' and end with '}'.\n"
+        "Rules: Use double quotes for all strings. No trailing commas.\n\n"
+        "Input:\n"
     )
+    prefix_tokens = _estimate_tokens(prefix)
+    desired_output_tokens = MAX_OUTPUT_TOKENS
+    available_for_json = max_total_tokens - prefix_tokens - desired_output_tokens
+    max_input_tokens = max(200, min(MAX_INPUT_TOKENS, max(200, available_for_json)))
+
+    bounded = _bounded_payload(payload, max_tokens=max_input_tokens)
+    input_json = json.dumps(bounded, ensure_ascii=False, indent=2)
+    prompt = prefix + input_json
+    # Shrink further if needed.
+    for _ in range(4):
+        if _estimate_tokens(prompt) + desired_output_tokens <= max_total_tokens:
+            break
+        max_input_tokens = max(200, int(max_input_tokens * 0.8))
+        bounded = _bounded_payload(bounded, max_tokens=max_input_tokens)
+        input_json = json.dumps(bounded, ensure_ascii=False, indent=2)
+        prompt = prefix + input_json
+
+    if _estimate_tokens(prompt) + desired_output_tokens > max_total_tokens:
+        raise ValueError(
+            f"Schema prompt too large for model context (prompt={_estimate_tokens(prompt)}, completion={desired_output_tokens}, "
+            f"limit={context_window}). Reduce input or increase DV_LLM_CONTEXT_WINDOW_TOKENS."
+        )
 
     last_error: Exception | None = None
-    prompt = base_prompt
     last_raw = ""
     for attempt in range(3):
-        raw, total_tokens, model_name = await _invoke_llm(prompt, 1200)
+        raw, total_tokens, model_name = await _invoke_llm(prompt, desired_output_tokens)
         last_raw = raw
         try:
             parsed = _parse_json(raw)
@@ -559,8 +680,8 @@ async def generate_schema_flow(
             await log_llm_usage(
                 feature="schema_flow:generate",
                 model=model_name,
-                input_tokens=max(1, len(input_json) // 4),
-                output_tokens=max(1, total_tokens - max(1, len(input_json) // 4)),
+                input_tokens=_estimate_tokens(prompt),
+                output_tokens=max(1, total_tokens - _estimate_tokens(prompt)),
                 tenant_id=tenant_id,
                 stage_name="schema_flow",
                 retry_count=attempt,
@@ -582,14 +703,26 @@ async def generate_schema_flow(
             return output
         except (ValidationError, ValueError, SyntaxError) as exc:
             last_error = exc
+            # Keep retry prompts short to avoid context overflows on small-context local models.
+            err = TokenLimiter.compress_text(str(exc), max_tokens=120)
+            prev = TokenLimiter.compress_text(str(last_raw or ""), max_tokens=260)
             prompt = (
-                f"{base_prompt}\n\n"
-                "Your previous output was invalid.\n"
-                "Return ONLY VALID JSON (no prose) with exactly keys: nodes, edges, summary.\n"
-                "Use double quotes for all strings. Do not include trailing commas.\n"
-                "Keep it compact and syntactically valid.\n"
-                f"Validation error: {str(exc)}\n"
-                f"Previous output:\n{last_raw}"
+                prefix
+                + input_json
+                + "\n\nYour previous output was invalid.\n"
+                "Return ONLY VALID JSON with exactly keys: nodes, edges, summary.\n"
+                f"Validation error (summary): {err}\n"
+                f"Previous output (truncated): {prev}\n"
             )
+            # Ensure prompt still fits budget.
+            if _estimate_tokens(prompt) + desired_output_tokens > max_total_tokens:
+                # Drop previous output entirely as a last resort.
+                prompt = (
+                    prefix
+                    + input_json
+                    + "\n\nYour previous output was invalid.\n"
+                    "Return ONLY VALID JSON with exactly keys: nodes, edges, summary.\n"
+                    f"Validation error (summary): {err}\n"
+                )
             continue
     raise ValueError(f"schema_flow failed: {last_error}")

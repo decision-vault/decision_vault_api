@@ -2,6 +2,7 @@ from pydantic import BaseModel
 
 
 class PRDGenerateRequest(BaseModel):
+    intake_id: str | None = None
     title: str
     problem_statement: str
     target_users: str

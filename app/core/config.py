@@ -101,15 +101,22 @@ class Settings(BaseSettings):
     llm_base_url: str | None = "https://generativelanguage.googleapis.com/v1beta/openai/"
     llm_max_input_tokens: int = 20000
     llm_max_output_tokens: int = 20000
+    # Total context window (prompt + completion) for the active chat model/provider.
+    # Used to keep prompts within provider limits (especially LM Studio / small-context models).
+    llm_context_window_tokens: int = 8192
+    llm_context_safety_margin_tokens: int = 256
     prd_generation_timeout_seconds: int = 5000
+    llm_request_timeout_seconds: int = 180
 
     hf_api_token: str = "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"
     hf_model_name: str = "Qwen/Qwen2-0.5B-Instruct"
     hf_tokenizer_name: str = ""
     hf_router_base_url: str = "https://router.huggingface.co/v1"
     hf_openai_model: str = "Qwen/Qwen2.5-7B-Instruct:together"
-    lmstudio_base_url: str = "http://localhost:1234/api/v1"
-    lmstudio_model: str = "qwen/qwen3.5-9b"
+    # Use 127.0.0.1 instead of localhost to avoid IPv6 (::1) resolution issues on some machines.
+    # LM Studio commonly listens on 127.0.0.1 only, which can cause timeouts when clients try ::1 first.
+    lmstudio_base_url: str = "http://127.0.0.1:1234/api/v1"
+    lmstudio_model: str = "meta-llama-3-8b-instruct"
     remote_provider: str = "lmstudio"
     lmstudio_chat_path: str = "/chat"
     model_run_mode: str = "remote"
@@ -118,6 +125,18 @@ class Settings(BaseSettings):
     hf_system_prompt: str = "You are a helpful assistant."
     hf_max_input_tokens: int = 2048
     hf_max_input_chars: int = 8000
+
+    # Email (SMTP) - used for org/team invites
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_username: str = "decisionvaultai@gmail.com"
+    smtp_password: str = "esft vdxa ifkk obsc"
+    smtp_from_email: str = "decisionvaultai@gmail.com"
+    smtp_from_name: str = "DecisionVault"
+    smtp_use_starttls: bool = True
+
+    org_invite_expires_hours: int = 72
+    org_invite_frontend_path: str = "/invite"
 
     class Config:
         env_prefix = "DV_"
