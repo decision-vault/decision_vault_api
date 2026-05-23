@@ -53,12 +53,6 @@ class Settings(BaseSettings):
     razorpay_amount_starter_paise: int = 0
     razorpay_amount_team_paise: int = 0
 
-    slack_client_id: str = "10553321666597.10560383537988"
-    slack_client_secret: str = "cb7d74cc9d121c43e621ee51060fe2b5"
-    slack_signing_secret: str = "5ab2b0c892a56ee904878775de2ccca0"
-    slack_redirect_uri: str = "https://homoeomorphic-especially-felecia.ngrok-free.dev/api/slack/oauth/callback"
-    slack_token_encryption_key: str = "uoZWtkpkDu71zaMpSzHnzpso"
-    slack_channel_cache_seconds: int = 300
 
     teams_client_id: str = ""
     teams_client_secret: str = ""
@@ -108,15 +102,15 @@ class Settings(BaseSettings):
     prd_generation_timeout_seconds: int = 5000
     llm_request_timeout_seconds: int = 180
 
-    hf_api_token: str = "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"
-    hf_model_name: str = "Qwen/Qwen2-0.5B-Instruct"
-    hf_tokenizer_name: str = ""
-    hf_router_base_url: str = "https://router.huggingface.co/v1"
-    hf_openai_model: str = "Qwen/Qwen2.5-7B-Instruct:together"
+    # hf_api_token: str = "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"
+    # hf_model_name: str = "Qwen/Qwen2-0.5B-Instruct"
+    # hf_tokenizer_name: str = ""
+    # hf_router_base_url: str = "https://router.huggingface.co/v1"
+    # hf_openai_model: str = "Qwen/Qwen2.5-7B-Instruct:together"
     # Use 127.0.0.1 instead of localhost to avoid IPv6 (::1) resolution issues on some machines.
     # LM Studio commonly listens on 127.0.0.1 only, which can cause timeouts when clients try ::1 first.
     lmstudio_base_url: str = "http://127.0.0.1:1234/api/v1"
-    lmstudio_model: str = "meta-llama-3-8b-instruct"
+    lmstudio_model: str = "gemma-4-e2b-it-mlx"
     remote_provider: str = "lmstudio"
     lmstudio_chat_path: str = "/chat"
     model_run_mode: str = "remote"

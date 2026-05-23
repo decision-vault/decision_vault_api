@@ -61,7 +61,7 @@ async def create_project(tenant_id: str, payload: dict) -> dict:
     base_slug = _slugify(payload["name"])
     slug = base_slug
     suffix = 1
-    while await db.projects.find_one({"tenant_id": _oid(tenant_id), "slug": slug, "deleted_at": None}):
+    while await db.projects.find_one({"tenant_id": _oid(tenant_id), "slug": slug}):
         suffix += 1
         slug = f"{base_slug}-{suffix}"
     doc = {

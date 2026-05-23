@@ -122,8 +122,4 @@ async def delete_org_user(
         return False
 
     await db.refresh_tokens.update_many({"user_id": target["_id"], "revoked": False}, {"$set": {"revoked": True}})
-    await db.project_members.update_many(
-        {"tenant_id": _oid(tenant_id), "user_id": target["_id"], "deleted_at": None},
-        {"$set": {"deleted_at": now, "deleted_by": _oid(actor_user_id)}},
-    )
     return True

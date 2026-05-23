@@ -19,7 +19,6 @@ PRODUCT_ROLES = {"superAdmin"}
 ORG_PERMISSIONS = {
     "billing.manage": {"owner"},
     "integrations.manage": {"owner", "admin"},
-    "decisions.create": {"owner", "admin", "member"},
     "org.read": {"owner", "admin", "member", "viewer"},
 }
 

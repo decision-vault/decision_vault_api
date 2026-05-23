@@ -136,7 +136,6 @@ Below is what each dependency is used for in this codebase.
 ### LLM orchestration & graph pipelines
 
 - `langchain`: prompt + output parsing primitives used in PRD/why-query flows.
-- `langgraph`: explicit deterministic control flow graphs for requirements + PRD generation + why-query (`StateGraph` patterns).
 - `langchain-openai`: ChatOpenAI wrapper used for OpenAI-compatible endpoints and LM Studio/OpenAI-style APIs.
 - `langchain-google-genai` + `google-generativeai`: Gemini provider support in some LLM flows (provider switch in settings).
 - `openai`: OpenAI SDK used by some LLM paths (and/or OpenAI-compatible provider clients).
@@ -399,52 +398,7 @@ Model inference endpoint supporting:
 
 ## 8) Generation pipelines (concepts + strategies)
 
-### 8.1 Requirements intake → clarification graph (LangGraph)
-File: `app/services/requirements_service.py`
-
-Flow:
-1. Parse raw text into a partial structured dict (regex + heuristics).
-2. Validate “required fields” + “low quality fields”.
-3. Build clarification questions for missing/low-quality fields.
-4. Collect answers and deep-merge into the structured model, then re-validate.
-
-Why this approach:
-- Keeps a deterministic loop: “validate → ask only what’s missing”.
-- Avoids a single LLM call that might invent details.
-- Produces a well-defined structured object that downstream generators can trust.
-
-Quality strategy:
-- Fields are classified as descriptive vs enum vs lists.
-- Placeholder detection prevents “TBD/later” from satisfying requirements.
-
-### 8.2 PRD generation graph (anti-hallucination + token budgets)
-File: `app/services/prd_graph_service.py`
-
-Key strategies:
-- **Structured output parsing** (PydanticOutputParser) to force JSON shape.
-- **Provider abstraction** supports `huggingface`, `lmstudio`, or OpenAI-style endpoints.
-- **TokenLimiter** enforces `DV_LLM_MAX_INPUT_TOKENS` and `DV_LLM_MAX_OUTPUT_TOKENS`.
-- **Hallucination detection**:
-  - Flags new numbers/integrations/currencies/percentages not present in the input.
-  - If flagged, retries with a stricter instruction to remove invented details.
-- **Caching**:
-  - Per-tenant cache key computed from normalized input (Redis preferred, memory fallback).
-
-Why this approach:
-- PRDs are high-risk for “confidently wrong” output; the pipeline nudges toward faithful expansion.
-- Token budgets prevent latency spikes and cost blowups.
-- Caching reduces repeated generation for identical inputs.
-
-### 8.3 “Unified runs” orchestration
-File: `app/api/generation.py`
-
-Strategy:
-- One `generation_runs` record per (project, kind) run, storing `status`, `child_run_id`, timestamps, and errors.
-- Supports replace/regenerate by stopping prior active runs best-effort.
-
-Why:
-- Keeps UI behavior consistent across PRD/SDD/schema/usecase/sequence/architecture runs.
-- Enables the backend to evolve individual generators without changing the UI contract.
+All LangGraph-based generation pipelines, including requirements intake, clarification graphs, and PRD generation graphs, have been removed from the backend to simplify the architecture.
 
 ## 9) Operational patterns implemented (and why)
 

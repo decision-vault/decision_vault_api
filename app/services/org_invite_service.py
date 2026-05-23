@@ -8,7 +8,7 @@ from bson import ObjectId
 from app.core.config import settings
 from app.core.rbac import ORG_ROLE_ORDER, org_role_at_least
 from app.db.mongo import get_db
-from app.services.project_member_service import add_project_member
+
 from app.utils.security import hash_password
 from app.utils.token import create_access_token, create_refresh_token, hash_token
 
@@ -221,24 +221,6 @@ async def accept_org_invite(*, token: str, password: str | None) -> dict:
         {"$set": {"accepted_at": now, "accepted_by_user_id": user["_id"]}},
     )
 
-    project_access = invite.get("project_access") or []
-    for entry in project_access:
-        project_id = entry.get("project_id")
-        if not project_id:
-            continue
-        try:
-            project_oid = project_id if isinstance(project_id, ObjectId) else _oid(str(project_id))
-        except Exception:
-            continue
-        project = await db.projects.find_one({"_id": project_oid, "tenant_id": tenant_oid, "deleted_at": None})
-        if not project:
-            continue
-        await add_project_member(
-            _safe_id(tenant_oid),
-            _safe_id(project_oid),
-            _safe_id(user["_id"]),
-            _normalize_project_role(entry.get("project_role")),
-        )
 
     access_token, expires_in = create_access_token(_safe_id(user["_id"]), _safe_id(tenant_oid), user["role"])
     refresh_token, jti, refresh_expires_at = create_refresh_token(

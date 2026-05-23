@@ -75,6 +75,17 @@ def requireOrgRole(
     return _dependency
 
 
+def _derive_project_role(org_role: str | None) -> str:
+    """Map an org role to a default project role.
+
+    Org owners and admins get ``project_admin``; everyone else gets
+    ``contributor`` so they can still read and write project data.
+    """
+    if (org_role or "").lower() in {"owner", "admin"}:
+        return "project_admin"
+    return "contributor"
+
+
 def requireProjectRole(
     *,
     min_role: str | None = None,
@@ -94,19 +105,19 @@ def requireProjectRole(
         if not project_id:
             raise _forbidden("Project id required")
 
+        # Verify the project belongs to the user's tenant
         db = get_db()
-        membership = await db.project_members.find_one(
+        project = await db.projects.find_one(
             {
+                "_id": _oid(project_id),
                 "tenant_id": _oid(tenant_id),
-                "project_id": _oid(project_id),
-                "user_id": _oid(user.get("user_id")),
                 "deleted_at": None,
             }
         )
-        if not membership:
-            raise _forbidden("Not a project member")
+        if not project:
+            raise _forbidden("Project not found in tenant")
 
-        role = membership.get("role")
+        role = _derive_project_role(user.get("role"))
         if permission and not project_permission_allows(role, permission):
             raise _forbidden("Insufficient project permission")
         if min_role and not project_role_at_least(role, min_role):
