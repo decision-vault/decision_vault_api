@@ -1,2 +1,31 @@
+[project]
+name = "decision-vault-api"
+version = "0.1.0"
+description = "DecisionVault FastAPI backend"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi==0.115.0",
+  "uvicorn==0.30.6",
+  "motor==3.5.1",
+  "pymongo==4.8.0",
+  "python-jose==3.3.0",
+  "passlib[bcrypt]==1.7.4",
+  "bcrypt==4.0.1",
+  "authlib==1.3.1",
+  "pydantic-settings==2.4.0",
+  "itsdangerous==2.2.0",
+  "email-validator==2.2.0",
+  "stripe==9.7.0",
+  "cryptography==42.0.8",
+  "msal==1.30.0",
+  "google-auth==2.33.0",
+  "google-auth-httplib2==0.2.0",
+  "fastapi-limiter==0.1.6",
+  "redis==5.0.8",
+  "httpx==0.27.2",
+  "python-multipart==0.0.9",
+  "asyncpg==0.29.0",
+]
+
 [tool.vercel]
 entrypoint = "index:app"
