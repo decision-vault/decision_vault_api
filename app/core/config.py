@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     google_client_id: str = ""
     google_client_secret: str = ""
-    google_redirect_uri: str = "http://localhost:8000/api/auth/google/callback"
+    google_redirect_uri: str = "https://decision-vault-2gmw4vff9-kaviyarasumarans-projects.vercel.app/api/auth/google/callback"
     langgraph_url: str = "http://localhost:8050"  
     frontend_base_url: str = "http://localhost:3000"
     cors_origins: list[str] = [
@@ -33,7 +33,10 @@ class Settings(BaseSettings):
         "http://127.0.0.1:4173",
         "http://127.0.0.1:8081",
         "https://decision-vault-api-ujco.vercel.app",
-       
+        "https://decision-vault-2gmw4vff9-kaviyarasumarans-projects.vercel.app",
+        "https://decision-vault-api-ujco.vercel.app",
+        "https://decision-vault-api.vercel.app",
+    ]
     cors_allow_methods: list[str] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     cors_allow_headers: list[str] = ["*"]
 
