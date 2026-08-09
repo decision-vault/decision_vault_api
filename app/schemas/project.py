@@ -7,11 +7,13 @@ from pydantic import BaseModel, Field
 class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=160)
     description: Optional[str] = Field(default=None, max_length=2000)
+    project_dir: Optional[str] = Field(default=None, max_length=500)
 
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=2, max_length=160)
     description: Optional[str] = Field(default=None, max_length=2000)
+    project_dir: Optional[str] = Field(default=None, max_length=500)
 
 
 class ProjectOut(BaseModel):
@@ -20,6 +22,7 @@ class ProjectOut(BaseModel):
     name: str
     slug: str
     description: Optional[str] = None
+    project_dir: Optional[str] = None
     status: Optional[str] = None
     status_message: Optional[str] = None
     can_restore: Optional[bool] = None

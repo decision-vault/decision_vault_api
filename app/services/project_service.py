@@ -69,6 +69,7 @@ async def create_project(tenant_id: str, payload: dict) -> dict:
         "name": payload["name"],
         "slug": slug,
         "description": payload.get("description"),
+        "project_dir": payload.get("project_dir"),
         "created_at": _utcnow(),
         "updated_at": _utcnow(),
         "last_used_at": _utcnow(),

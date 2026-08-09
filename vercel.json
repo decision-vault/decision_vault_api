@@ -1,15 +1,9 @@
 {
-  "builds": [
-    {
-      "src": "index.py",
-      "use": "@vercel/python",
-      "config": { "maxDuration": 60 }
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "pip install -r requirements.cloud.txt",
+  "functions": {
+    "index.py": {
+      "maxDuration": 800
     }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "index.py"
-    }
-  ]
+  }
 }
