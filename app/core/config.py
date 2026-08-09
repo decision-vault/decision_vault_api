@@ -32,11 +32,8 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
         "http://127.0.0.1:4173",
         "http://127.0.0.1:8081",
-        "https://decision-vault-api-ujco-gkgai10tj-kaviyarasumarans-projects.vercel.app",
-        "https://decision-vault-2gmw4vff9-kaviyarasumarans-projects.vercel.app",
         "https://decision-vault-api-ujco.vercel.app",
-        "https://decision-vault-api.vercel.app",
-    ]
+       
     cors_allow_methods: list[str] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     cors_allow_headers: list[str] = ["*"]
 
