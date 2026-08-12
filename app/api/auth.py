@@ -191,6 +191,7 @@ async def session(user=Depends(get_current_user)):
         "email": user_doc.get("email", ""),
         "role": user_doc.get("role", ""),
         "provider": user_doc.get("provider", ""),
+        "full_name": user_doc.get("full_name"),
         "last_login_at": user_doc.get("last_login_at"),
         "tenant_name": tenant_doc.get("name", "") if tenant_doc else "",
         "tenant_slug": tenant_doc.get("slug", "") if tenant_doc else "",

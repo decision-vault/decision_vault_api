@@ -6,8 +6,10 @@ from datetime import datetime
 class ChatVersionLog(BaseModel):
     timestamp: str = Field(..., description="ISO string timestamp tracking the exact moment of modification")
     agent_prompt_or_chat: str = Field(..., description="The context prompt or user command triggering this revision snapshot")
-    saved_snapshot_body: str = Field(..., description="The complete HTML/Quill content snapshot state captured at this exact mark")
+    saved_snapshot_body: Optional[str] = Field(None, description="The complete HTML/Quill content snapshot state captured at this exact mark")
     is_plan_card: Optional[bool] = Field(default=False, description="Flag indicating if this message represents a generated project plan card")
+    is_doc_snapshot: Optional[bool] = Field(default=False, description="Flag indicating this entry is a full generated document (PRD / strategy analysis)")
+    citations: Optional[List[dict]] = Field(default=None, description="Optional grounded-knowledge citations attached to this message")
 
 # --- DOCUMENT SCHEMAS ---
 class DocumentBase(BaseModel):
@@ -26,6 +28,7 @@ class DocumentResponse(DocumentBase):
     workspace_id: str
     updated_at: datetime
     chat_history: List[ChatVersionLog] = Field(default=[], description="Append-only collection tracking chat history and code revisions")
+    last_execution: Optional[dict] = Field(default=None, description="Summary of the most recent agent execution (steps + response) for activity-panel restore")
 
     class Config:
         populate_by_name = True

@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     razorpay_amount_starter_paise: int = 0
     razorpay_amount_team_paise: int = 0
 
+    # Stripe (used for paid plans). When keys are empty the billing service
+    # runs in "local mode": plan changes and invoices are recorded in MongoDB
+    # and no real charges are attempted.
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_currency: str = "USD"
+    stripe_success_url: str = "https://decision-vault-2gmw4vff9-kaviyarasumarans-projects.vercel.app/organizations/{org_id}/billing"
+    stripe_cancel_url: str = "https://decision-vault-2gmw4vff9-kaviyarasumarans-projects.vercel.app/organizations/{org_id}/billing"
+
     redis_url: str = "redis://localhost:6379/0"
     enable_rate_limiter: bool = True
 
@@ -79,6 +88,14 @@ class Settings(BaseSettings):
 
     org_invite_expires_hours: int = 72
     org_invite_frontend_path: str = "/invite"
+
+    # Project-scoped team invites
+    project_invite_expires_hours: int = 72
+    project_invite_frontend_path: str = "/invite/project"
+
+    # Soft-deleted ("paused") organizations are hard-deleted after this grace period
+    tenant_delete_grace_days: int = 30
+    tenant_delete_sweep_seconds: int = 6 * 60 * 60
 
     class Config:
         env_prefix = "DV_"

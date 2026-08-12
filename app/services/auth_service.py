@@ -41,12 +41,32 @@ def _build_trial_license(tenant_id: ObjectId) -> dict:
     start_date = _utcnow()
     return {
         "tenant_id": tenant_id,
-        "plan": "trial",
+        "plan": "free",
         "status": "active",
+        "billing_cycle": "monthly",
         "start_date": start_date,
-        "expiry_date": start_date + timedelta(days=settings.trial_days),
+        "current_period_start": start_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+        "current_period_end": start_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0) + timedelta(days=31),
         "grace_period_days": settings.trial_grace_days,
+        "billing_email": None,
+        "additional_emails": [],
+        "address": {
+            "full_name": None,
+            "country": None,
+            "address": None,
+            "tax_id": None,
+            "tax_id_type": None,
+        },
+        "spend_cap_enabled": True,
+        "credit_balance": 0.0,
+        "invoices": [],
+        "invoice_seq": 0,
+        "payment_methods": [],
+        "stripe_customer_id": None,
+        "stripe_subscription_id": None,
+        "usage": {},
         "created_at": start_date,
+        "updated_at": start_date,
         "deleted_at": None,
         "deleted_by": None,
     }
@@ -127,7 +147,14 @@ async def signup(tenant_name: str, email: str, password: str) -> dict:
     user = await db.users.insert_one(user_doc)
     user_id = user.inserted_id
 
-    await db.licenses.insert_one(_build_trial_license(tenant_id))
+    license_doc = _build_trial_license(tenant_id)
+    license_doc["billing_email"] = email.lower()
+    await db.licenses.insert_one(license_doc)
+
+    await db.tenants.update_one(
+        {"_id": tenant_id},
+        {"$set": {"owner_user_ids": [user_id]}},
+    )
 
     user_doc["_id"] = user_id
     tokens = _issue_tokens(user_doc)
@@ -254,7 +281,13 @@ async def google_login(
         user_doc = _build_user(tenant["_id"], email, None, "owner", "google")
         user_insert = await db.users.insert_one(user_doc)
         user_doc["_id"] = user_insert.inserted_id
-        await db.licenses.insert_one(_build_trial_license(tenant["_id"]))
+        license_doc = _build_trial_license(tenant["_id"])
+        license_doc["billing_email"] = email.lower()
+        await db.licenses.insert_one(license_doc)
+        await db.tenants.update_one(
+            {"_id": tenant["_id"]},
+            {"$addToSet": {"owner_user_ids": user_insert.inserted_id}},
+        )
         user = user_doc
     else:
         if user.get("deleted_at") is not None:

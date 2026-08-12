@@ -16,9 +16,11 @@ from app.services.project_service import (
     restore_project,
     update_project,
 )
+from app.services.dashboard_service import build_owner_dashboard_summary
 from app.services.docs_management_service import DocsManagementService
 from app.db.mongo import get_db
 from app.core.config import settings
+from app.services.license_service import QuotaExceededError, enforce_quota
 
 logger = logging.getLogger("decisionvault.projects")
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -52,7 +54,7 @@ async def list_projects_route(
     user=Depends(withGuard(feature="view_decision", orgRole="viewer")),
 ):
     projects = await list_projects(
-        user.get("tenant_id"),
+        request.state.tenant_id,
         search=q,
         status=status,
     )
@@ -67,9 +69,21 @@ async def create_project_route(
 ):
     tenant_id = request.state.tenant_id
     db = get_db()
+
+    # License quota check: Free/Lite plans cap the number of active projects.
+    try:
+        await enforce_quota(tenant_id, "projects")
+    except QuotaExceededError as exc:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"This organization's {exc.plan} plan is limited to {exc.limit} project(s). "
+                "Upgrade to Lite or Pro to create more projects."
+            ),
+        )
     
     # 1. Spawn parent database record tracking matrix fields
-    project = await create_project(tenant_id, payload.model_dump())
+    project = await create_project(tenant_id, payload.model_dump(), owner_id=user.get("user_id"))
     project_id = project.get("_id") or project.get("id")
     
     # 2. AUTOMATION HOOK: Instantly provision default workspace structure and a pristine baseline PRD anchor file
@@ -225,95 +239,15 @@ async def get_owner_dashboard_summary(
     days: int = 7,
     _guard=Depends(withGuard(feature="view_decision", projectRole="viewer")),
 ):
-    if days < 1 or days > 30:
-        raise HTTPException(status_code=400, detail="days must be between 1 and 30")
-    db = get_db()
-    tenant_id = request.state.tenant_id
-    tenant_oid = ObjectId(tenant_id)
-    project_oid = ObjectId(project_id)
-
-    project = await db.projects.find_one(
-        {"_id": project_oid, "tenant_id": tenant_oid},
-        {"name": 1, "status": 1, "created_at": 1, "updated_at": 1, "description": 1},
-    )
-    if not project:
+    if days < 1 or days > 90:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 90")
+    try:
+        summary = await build_owner_dashboard_summary(
+            request.state.tenant_id, project_id, days
+        )
+    except LookupError:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    members_count = await db.users.count_documents(
-        {"tenant_id": tenant_oid, "deleted_at": None, "is_active": True}
-    )
-
-    recent_activity_query = {
-        "tenant_id": tenant_oid,
-        "$or": [
-            {"entity_id": project_id},
-            {"metadata.project_id": project_id},
-            {"action": {"$regex": "project", "$options": "i"}},
-        ],
-    }
-    recent_activity_docs = await db.audit_logs.find(
-        recent_activity_query,
-        {"action": 1, "entity_type": 1, "entity_id": 1, "actor_id": 1, "created_at": 1, "metadata": 1},
-    ).sort("_id", -1).limit(12).to_list(length=12)
-    recent_activity = [
-        {
-            "id": str(doc["_id"]),
-            "action": doc.get("action") or "event",
-            "entity_type": doc.get("entity_type") or "unknown",
-            "entity_id": _json_safe(doc.get("entity_id")) or "",
-            "actor_id": str(doc.get("actor_id")) if doc.get("actor_id") else "",
-            "created_at": doc.get("created_at"),
-            "metadata": _json_safe(doc.get("metadata") or {}),
-        }
-        for doc in recent_activity_docs
-    ]
-
-    return {
-        "window_days": days,
-        "project": {
-            "id": str(project["_id"]),
-            "name": project.get("name") or "Project",
-            "description": project.get("description") or "",
-            "status": project.get("status") or "active",
-            "created_at": project.get("created_at"),
-            "updated_at": project.get("updated_at"),
-        },
-        "kpis": {
-            "members": members_count,
-            "decisions_total": 0,
-            "decisions_window": 0,
-            "prd_runs_window": 0,
-            "active_prd_runs": 0,
-        },
-        "requirements": {
-            "status": None,
-            "created_at": None,
-            "updated_at": None,
-        },
-        "prd": {
-            "latest_status": None,
-            "latest_created_at": None,
-            "latest_updated_at": None,
-            "latest_completed_at": None,
-            "latest_version": None,
-        },
-        "llm_usage": {
-            "window_days": days,
-            "requests": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "estimated_cost": 0.0,
-            "avg_tokens_per_request": 0.0,
-            "max_tokens_per_request": 0,
-            "token_budget_per_request": 0,
-            "token_headroom_percent": 100.0,
-            "by_feature": [],
-            "daily": [],
-        },
-        "recent_decisions": [],
-        "recent_activity": recent_activity,
-    }
+    return summary
 
 
 @router.put("/{project_id}", response_model=ProjectOut)

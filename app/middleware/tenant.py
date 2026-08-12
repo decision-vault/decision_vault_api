@@ -1,6 +1,8 @@
 from fastapi import Depends, HTTPException, Request
 
+from app.db.mongo import get_db
 from app.middleware.auth import get_current_user
+from app.services.tenant_service import user_owns_tenant
 
 
 def _forbidden(detail: str = "Forbidden") -> HTTPException:
@@ -22,6 +24,11 @@ def _resolve_tenant_id(request: Request) -> str | None:
 async def resolve_tenant(request: Request, user=Depends(get_current_user)) -> str:
     tenant_id = _resolve_tenant_id(request) or user.get("tenant_id")
     if tenant_id != user.get("tenant_id"):
-        raise _forbidden("Tenant mismatch")
+        # Allow access to organizations the user owns, even when it is not
+        # the primary tenant in their token (multi-org ownership).
+        owned = await user_owns_tenant(user.get("user_id"), tenant_id)
+        if not owned:
+            raise _forbidden("Tenant mismatch")
+        request.state.tenant_role = "owner"
     request.state.tenant_id = tenant_id
     return tenant_id

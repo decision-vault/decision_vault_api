@@ -1,3 +1,6 @@
+import asyncio
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -7,6 +10,12 @@ import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app.api.auth import router as auth_router
+from app.api.account import router as account_router
+from app.api.billing import router as billing_router
+from app.api.usage import router as usage_router
+from app.api.feedback import router as feedback_router
+from app.api.troubleshooting import router as troubleshooting_router
+from app.api.notifications import router as notifications_router, ws_router as notifications_ws_router
 from app.api.orgs import router as orgs_router
 from app.api.projects import router as projects_router
 from app.api.tasks import router as tasks_router
@@ -17,14 +26,28 @@ from app.api.canvases import router as canvases_router
 from app.api.prd_planner import router as prd_planner_router
 from app.api.local_workspace import router as local_workspace_router
 from app.api.sprint_build import router as sprint_build_router
+from app.api.project_team import router as project_team_router
+from app.api.knowledge import router as knowledge_router
 from app.core.config import settings
 from app.db.mongo import get_db
-
-import logging
+from app.services.tenant_service import sweep_expired_deleted_tenants
 
 app = FastAPI(title=settings.app_name)
 
 logger = logging.getLogger("decisionvault.startup")
+
+
+async def _tenant_purge_loop() -> None:
+    """Periodically hard-delete organizations past their delete grace period."""
+    await asyncio.sleep(settings.tenant_delete_sweep_seconds)
+    while True:
+        try:
+            removed = await sweep_expired_deleted_tenants(settings.tenant_delete_grace_days)
+            if removed:
+                logger.info("tenant_purge_removed=%s", {"tenant_ids": removed})
+        except Exception:
+            logger.exception("tenant_purge_sweep_failed")
+        await asyncio.sleep(settings.tenant_delete_sweep_seconds)
 
 # =====================================================
 # Middleware
@@ -59,6 +82,16 @@ async def startup() -> None:
         "slug",
         unique=True,
     )
+
+    # Soft-deleted ("paused") organizations: index used by the purge sweep.
+    await db.tenants.create_index(
+        [("deleted_at", 1)],
+    )
+
+    # -----------------------------
+    # Tenant purge sweep
+    # -----------------------------
+    asyncio.create_task(_tenant_purge_loop())
 
     # -----------------------------
     # Users
@@ -114,6 +147,47 @@ async def startup() -> None:
     )
 
     # -----------------------------
+    # Project Members
+    # -----------------------------
+    await db.project_members.create_index(
+        [("project_id", 1), ("user_id", 1)],
+        unique=True,
+        partialFilterExpression={"removed_at": None},
+    )
+
+    await db.project_members.create_index(
+        [("tenant_id", 1)],
+    )
+
+    await db.project_members.create_index(
+        [("user_id", 1)],
+    )
+
+    # -----------------------------
+    # Project Invites
+    # -----------------------------
+    await db.project_invites.create_index(
+        "token_hash",
+        unique=True,
+    )
+
+    await db.project_invites.create_index(
+        [
+            ("project_id", 1),
+            ("created_at", -1),
+        ]
+    )
+
+    await db.project_invites.create_index(
+        [("email", 1), ("status", 1)],
+    )
+
+    await db.project_invites.create_index(
+        "expires_at",
+        expireAfterSeconds=0,
+    )
+
+    # -----------------------------
     # Audit Logs
     # -----------------------------
     await db.audit_logs.create_index(
@@ -123,7 +197,33 @@ async def startup() -> None:
         ]
     )
 
-    
+    # -----------------------------
+    # Usage Daily
+    # -----------------------------
+    await db.usage_daily.create_index(
+        [("tenant_id", 1), ("date", -1), ("project_id", 1)],
+    )
+
+    # -----------------------------
+    # Feedback / Issues
+    # -----------------------------
+    await db.feedback.create_index(
+        [("tenant_id", 1), ("created_at", -1)],
+    )
+
+    # -----------------------------
+    # Troubleshooting
+    # -----------------------------
+    await db.troubleshooting.create_index(
+        [("tenant_id", 1), ("category", 1)],
+    )
+
+    # -----------------------------
+    # Notifications
+    # -----------------------------
+    await db.notifications.create_index(
+        [("tenant_id", 1), ("user_id", 1), ("is_read", 1), ("created_at", -1)],
+    )
 
     # -----------------------------
     # Rate Limiter
@@ -156,6 +256,13 @@ async def startup() -> None:
 # =====================================================
 
 app.include_router(auth_router)
+app.include_router(account_router)
+app.include_router(billing_router)
+app.include_router(usage_router)
+app.include_router(feedback_router)
+app.include_router(troubleshooting_router)
+app.include_router(notifications_router)
+app.include_router(notifications_ws_router)
 app.include_router(orgs_router)
 app.include_router(projects_router)
 app.include_router(tasks_router)
@@ -166,6 +273,8 @@ app.include_router(canvases_router)
 app.include_router(prd_planner_router)
 app.include_router(local_workspace_router)
 app.include_router(sprint_build_router)
+app.include_router(project_team_router)
+app.include_router(knowledge_router)
 # =====================================================
 # Health Checks
 # =====================================================

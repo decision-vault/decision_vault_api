@@ -13,6 +13,7 @@ from app.middleware.guard import withGuard
 from app.core.config import settings
 from app.db.mongo import get_db
 from app.utils.serialize import serialize_doc
+from app.services.usage_service import estimate_tokens, record_usage
 
 logger = logging.getLogger("decisionvault.canvases")
 
@@ -54,6 +55,13 @@ async def generate_canvas(
                 logger.error(f"Agent returned status {resp.status_code}: {resp.text[:500]}")
                 raise HTTPException(status_code=500, detail=f"UI builder agent failed: {resp.text}")
             layout_data = resp.json()
+            await record_usage(
+                tenant_id,
+                project_id=payload.project_id,
+                feature="ui_builder",
+                prompt_tokens=estimate_tokens(prd_body),
+                completion_tokens=estimate_tokens(json.dumps(layout_data) if layout_data else ""),
+            )
             logger.info(f"Agent response keys: {list(layout_data.keys()) if isinstance(layout_data, dict) else type(layout_data)}")
             logger.info(f"Pages count: {len(layout_data.get('pages', [])) if isinstance(layout_data, dict) else 'N/A'}")
         except httpx.TimeoutException:
@@ -128,6 +136,13 @@ async def generate_canvas_stream(
                 logger.error(f"Agent returned status {resp.status_code}: {resp.text[:500]}")
                 raise HTTPException(status_code=500, detail=f"UI builder agent failed: {resp.text}")
             layout_data = resp.json()
+            await record_usage(
+                tenant_id,
+                project_id=payload.project_id,
+                feature="ui_builder",
+                prompt_tokens=estimate_tokens(prd_body),
+                completion_tokens=estimate_tokens(json.dumps(layout_data) if layout_data else ""),
+            )
             logger.info(f"Stream endpoint - Agent response keys: {list(layout_data.keys()) if isinstance(layout_data, dict) else type(layout_data)}")
             logger.info(f"Stream endpoint - Pages count: {len(layout_data.get('pages', [])) if isinstance(layout_data, dict) else 'N/A'}")
         except httpx.TimeoutException:

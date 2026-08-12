@@ -14,7 +14,23 @@ from app.schemas.org_invite import OrgInviteAccept, OrgInviteCreate, OrgInviteCr
 from app.schemas.org_user import OrgUserOut, OrgUserUpdate
 from app.services.email_service import send_org_invite_email
 from app.services.audit_service import log_event
-from app.services.tenant_service import create_tenant, delete_tenant, get_tenant, list_tenants, update_tenant
+from app.services.tenant_service import (
+    create_tenant,
+    delete_tenant,
+    get_tenant,
+    list_owned_tenants,
+    list_tenants,
+    restore_tenant,
+    update_tenant,
+    user_owns_tenant,
+)
+from app.services.license_service import (
+    QuotaExceededError,
+    create_license,
+    enforce_team_member_quota,
+    get_or_create_license,
+    get_billing_overview,
+)
 from app.services.org_invite_service import accept_org_invite, create_org_invite, list_org_invites
 from app.services.org_user_service import delete_org_user, list_org_users, set_org_user_active
 from app.db.mongo import get_db
@@ -75,6 +91,25 @@ def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
     )
 
 
+async def _attach_plan(doc: dict) -> dict:
+    """Attach the org's active plan + status to a tenant payload."""
+    if not doc:
+        return doc
+    try:
+        tenant_key = doc.get("_id") or doc.get("id")
+        if not tenant_key:
+            doc.setdefault("plan", "free")
+            doc.setdefault("plan_status", "active")
+            return doc
+        license_doc = await get_or_create_license(tenant_key)
+        doc["plan"] = license_doc.get("plan")
+        doc["plan_status"] = license_doc.get("status")
+    except Exception:
+        doc.setdefault("plan", "free")
+        doc.setdefault("plan_status", "active")
+    return doc
+
+
 @router.get("/me", response_model=TenantOut)
 async def get_org(
     request: Request,
@@ -83,6 +118,7 @@ async def get_org(
     tenant = await get_tenant(request.state.tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Organization not found")
+    await _attach_plan(tenant)
     return _normalize(tenant)
 
 
@@ -102,6 +138,7 @@ async def update_org(
         entity_type="tenant",
         entity_id=request.state.tenant_id,
     )
+    await _attach_plan(updated)
     return _normalize(updated)
 
 
@@ -120,7 +157,30 @@ async def delete_org(
         entity_type="tenant",
         entity_id=request.state.tenant_id,
     )
-    return {"status": "deleted"}
+    return {"status": "deleting", "deleted_at": deleted.get("deleted_at")}
+
+
+@router.post("/me/restore", response_model=TenantOut)
+async def restore_org(
+    request: Request,
+    user=Depends(withGuard(feature="edit_decision", orgRole="owner")),
+):
+    tenant = await get_tenant(request.state.tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if not tenant.get("deleted_at"):
+        return _normalize(tenant)
+    restored = await restore_tenant(request.state.tenant_id)
+    if not restored:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    await log_event(
+        tenant_id=request.state.tenant_id,
+        actor_id=user.get("user_id"),
+        action="org.restored",
+        entity_type="tenant",
+        entity_id=request.state.tenant_id,
+    )
+    return _normalize(restored)
 
 
 @router.get("", response_model=list[TenantOut])
@@ -128,17 +188,44 @@ async def list_orgs(
     q: str | None = None,
     user=Depends(get_current_user),
 ):
-    if not is_super_admin(user.get("role")):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    tenants = await list_tenants(search=q)
-    return [_normalize(doc) for doc in tenants]
+    if is_super_admin(user.get("role")):
+        tenants = await list_tenants(search=q)
+    else:
+        tenants = await list_owned_tenants(user.get("user_id"))
+    result = []
+    for doc in tenants:
+        await _attach_plan(doc)
+        result.append(_normalize(doc))
+    return result
 
 
 @router.post("", response_model=TenantOut)
 async def create_org(payload: TenantCreate, user=Depends(get_current_user)):
-    if not is_super_admin(user.get("role")):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    tenant = await create_tenant(payload.name)
+    db = get_db()
+    actor = await db.users.find_one(
+        {"_id": ObjectId(user.get("user_id"))}, {"email": 1}
+    )
+    actor_email = (actor or {}).get("email")
+
+    tenant = await create_tenant(payload.name, owner_user_id=user.get("user_id"))
+    try:
+        await create_license(
+            tenant["_id"],
+            plan=payload.plan,
+            billing_email=actor_email,
+        )
+    except QuotaExceededError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
+
+    await log_event(
+        tenant_id=tenant["_id"],
+        actor_id=user.get("user_id"),
+        action="org.created",
+        entity_type="tenant",
+        entity_id=tenant["_id"],
+        metadata={"plan": payload.plan},
+    )
+    await _attach_plan(tenant)
     return _normalize(tenant)
 
 
@@ -169,6 +256,7 @@ async def create_org_invite_route(
         project_access = [item.model_dump() for item in payload.project_access]
 
     try:
+        await enforce_team_member_quota(request.state.tenant_id, pending_email=str(payload.email))
         invite_doc, raw_token = await create_org_invite(
             tenant_id=request.state.tenant_id,
             inviter_user_id=user.get("user_id"),
@@ -179,6 +267,8 @@ async def create_org_invite_route(
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+    except QuotaExceededError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -268,6 +358,9 @@ async def reinvite_org_invite_route(
         ]
 
     try:
+        await enforce_team_member_quota(
+            request.state.tenant_id, pending_email=str(existing.get("email") or "")
+        )
         invite_doc, raw_token = await create_org_invite(
             tenant_id=request.state.tenant_id,
             inviter_user_id=user.get("user_id"),
@@ -278,6 +371,8 @@ async def reinvite_org_invite_route(
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+    except QuotaExceededError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

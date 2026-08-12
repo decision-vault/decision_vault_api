@@ -56,7 +56,7 @@ def _slugify(value: str) -> str:
     return "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in value).split())
 
 
-async def create_project(tenant_id: str, payload: dict) -> dict:
+async def create_project(tenant_id: str, payload: dict, owner_id: str | None = None) -> dict:
     db = get_db()
     base_slug = _slugify(payload["name"])
     slug = base_slug
@@ -70,6 +70,7 @@ async def create_project(tenant_id: str, payload: dict) -> dict:
         "slug": slug,
         "description": payload.get("description"),
         "project_dir": payload.get("project_dir"),
+        "owner_id": _oid(owner_id) if owner_id else None,
         "created_at": _utcnow(),
         "updated_at": _utcnow(),
         "last_used_at": _utcnow(),

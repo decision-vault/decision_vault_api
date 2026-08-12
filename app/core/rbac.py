@@ -27,6 +27,8 @@ PROJECT_PERMISSIONS = {
     "project.manage": {"project_admin"},
     "project.write": {"project_admin", "contributor"},
     "project.read": {"project_admin", "contributor", "viewer"},
+    "project.members.manage": {"project_admin"},
+    "project.invites.manage": {"project_admin"},
 }
 
 

@@ -102,11 +102,17 @@ class DocsManagementService:
     async def update_document(
         document_id: str, 
         payload: Dict[str, Any], 
-        agent_chat_msg: Optional[str] = None
+        agent_chat_msg: Optional[str] = None,
+        citations: Optional[List[Dict[str, Any]]] = None,
+        is_doc_snapshot: bool = False,
+        snapshot_body: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Handles inline character pushes, while atomically appending timestamped 
         chat logs and historical snapshots inside the specific targeted record document file.
+        `is_doc_snapshot` tags a chat entry as a full generated document so the UI can
+        render it as an individual accessible card; `snapshot_body` stores the exact
+        generated document body for that entry.
         """
         db = get_db()
         if not ObjectId.is_valid(document_id):
@@ -122,11 +128,22 @@ class DocsManagementService:
 
         #  Single File Version Tracker Matrix
         if agent_chat_msg or "body" in payload:
+            current_body = ""
+            if snapshot_body:
+                current_body = snapshot_body
+            elif "body" in payload and payload.get("body"):
+                current_body = payload["body"]
+            else:
+                existing = await db.documents.find_one({"_id": ObjectId(document_id)})
+                current_body = existing.get("body", "") if existing else ""
             history_snapshot = {
                 "timestamp": now.isoformat(),
                 "agent_prompt_or_chat": agent_chat_msg or "Manual content synchronized inline inside editor console workspace.",
-                "saved_snapshot_body": payload.get("body", "") or (await db.documents.find_one({"_id": ObjectId(document_id)}))["body"]
+                "saved_snapshot_body": current_body,
+                "is_doc_snapshot": bool(is_doc_snapshot),
             }
+            if citations:
+                history_snapshot["citations"] = citations
             update_query["$push"] = {"chat_history": history_snapshot}
 
         updated_doc = await db.documents.find_one_and_update(

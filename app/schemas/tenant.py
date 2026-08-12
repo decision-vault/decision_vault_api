@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 class TenantCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
+    plan: str = Field(default="free", max_length=20)
 
 
 class TenantUpdate(BaseModel):
@@ -17,3 +18,7 @@ class TenantOut(BaseModel):
     name: str
     slug: str
     created_at: datetime
+    deleted_at: Optional[datetime] = None
+    deleted_by: Optional[str] = None
+    plan: Optional[str] = None
+    plan_status: Optional[str] = None

@@ -58,3 +58,23 @@ def send_org_invite_email(
         "If you weren't expecting this, you can ignore this email."
     )
     send_email(to_email=to_email, subject=subject, text_body=text_body)
+
+
+def send_project_invite_email(
+    *,
+    to_email: str,
+    invite_link: str,
+    inviter_email: str | None,
+    role: str,
+    project_name: str | None,
+) -> None:
+    project_label = project_name or "a DecisionVault project"
+    inviter_label = inviter_email or "a project admin"
+    subject = f"You've been invited to {project_label}"
+    text_body = (
+        f"{inviter_label} invited you to collaborate on the project \"{project_label}\" "
+        f"as {role}.\n\n"
+        f"Accept invite: {invite_link}\n\n"
+        "If you weren't expecting this, you can ignore this email."
+    )
+    send_email(to_email=to_email, subject=subject, text_body=text_body)
